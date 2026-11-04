@@ -45,7 +45,8 @@
   .msg.user { background: #1d3b4a; align-self: flex-end; }
   .msg .ar { font-size: 1.15rem; direction: rtl; text-align: right; font-family: "Segoe UI", "Traditional Arabic", serif; }
   .msg .tr { color: var(--muted); font-size: .82rem; margin-top: 6px; }
-  .msg .corr { color: #ffd479; font-size: .85rem; margin-top: 6px; border-top: 1px solid #33415c; padding-top: 6px; }
+  .msg .corr { color: #ffd479; font-size: .85rem; margin-top: 6px; border-top: 1px solid #33415c; padding-top: 6px; white-space: pre-line; line-height: 1.5; }
+  .msg .corr.ok { color: var(--accent); }
   .status { color: var(--muted); font-style: italic; font-size: .85rem; align-self: center; }
   .status.good { color: var(--accent); }
 
@@ -306,7 +307,7 @@ $('micBtn').onclick = () => {
 $('sendVoiceBtn').onclick = () => stopSession(true);
 
 /* ---------- chat UI ---------- */
-function addMsg(role, ar, tr, corr) {
+function addMsg(role, ar, tr, corr, ok) {
   const d = document.createElement('div');
   d.className = 'msg ' + (role === 'assistant' ? 'bot' : 'user');
   d.innerHTML = `<div class="ar"></div>` +
@@ -314,7 +315,11 @@ function addMsg(role, ar, tr, corr) {
     (corr ? `<div class="corr"></div>` : '');
   d.querySelector('.ar').textContent = ar;
   if (tr) d.querySelector('.tr').textContent = 'Перевод: ' + tr;
-  if (corr) d.querySelector('.corr').textContent = '✎ ' + corr;
+  if (corr) {
+    const c = d.querySelector('.corr');
+    c.textContent = (ok ? '✓ ' : '✎ ') + corr;
+    if (ok) c.classList.add('ok');
+  }
   chat.appendChild(d);
   chat.scrollTop = chat.scrollHeight;
   return d;
@@ -325,8 +330,9 @@ function status(t, cls) { const s = document.createElement('div'); s.className =
 function parseReply(reply) {
   const ar = (reply.match(/AR:\s*([\s\S]*?)(?:RU:|FIX:|$)/) || [])[1]?.trim() || reply;
   const ru = (reply.match(/RU:\s*([\s\S]*?)(?:FIX:|$)/) || [])[1]?.trim();
-  const fix = (reply.match(/FIX:\s*([\s\S]*)/) || [])[1]?.trim();
-  return { ar, ru, fix: fix && !/^отлично/i.test(fix) ? fix : null };
+  const fixRaw = (reply.match(/FIX:\s*([\s\S]*)/) || [])[1]?.trim() || '';
+  const ok = /^отлично/i.test(fixRaw);
+  return { ar, ru, fix: fixRaw || null, ok };
 }
 
 /* ---------- запрос к локальному прокси (AnyModel → DeepSeek) ---------- */
@@ -336,8 +342,8 @@ async function callModel() {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       messages: [{ role: 'system', content: systemPrompt() }, ...messages],
-      temperature: 0.7,
-      max_tokens: 400,
+      temperature: 0.5,
+      max_tokens: 700,
     }),
   });
   const data = await resp.json();
@@ -359,14 +365,27 @@ function systemPrompt() {
     work: 'тема: работа и учёба, собеседования, университет',
     daily: 'тема: повседневная жизнь, семья, хобби, распорядок дня'
   }[$('topic').value];
-  return `Ты — дружелюбный преподаватель и собеседник по литературному арабскому языку (фусха). Уровень ученика: ${lv}. Ситуация: ${tp}.
-Правила:
-1. Отвечай КРАТКО (1-3 коротких предложения) и всегда задавай встречный вопрос, чтобы поддерживать диалог.
-2. Формат ответа строго такой (три строки, ровно эти метки):
-AR: <твоя фраза на арабском>
-RU: <перевод твоей фразы на русский>
-FIX: <если ученик ошибся — правильный арабский вариант его фразы и краткое пояснение по-русски. Если ошибок нет — напиши "Отлично!">
-3. Никакого другого текста, никаких markdown-звёздочек.`;
+  return `Ты — преподаватель литературного арабского языка (фусха) и дружелюбный собеседник. Уровень ученика: ${lv}. Ситуация: ${tp}.
+
+Твоя задача — вести живой диалог И обязательно проверять ПОСЛЕДНЮЮ фразу ученика.
+
+Структура ответа строго (ровно эти метки, в этом порядке, без markdown-звёздочек):
+AR: <твой ответ по-арабски: 1–3 коротких предложения и встречный вопрос>
+RU: <перевод твоего ответа на русский>
+FIX: <разбор ошибок в последней фразе ученика>
+
+Правила для FIX:
+- Разбирай ВСЕ реальные ошибки ученика, каждую с новой строки, в формате:
+  • Грамматика: «неверно» → «верно» — короткое пояснение по-русски.
+  • Лексика: «неудачное слово» → «лучше ...» — почему.
+  • Порядок слов / предлоги / артикль / род / число / падеж — так же, если применимо.
+- Пояснения — по-русски, коротко и понятно. Указывай только проблемные места, не переписывай всю фразу, если она верна.
+- Не выдумывай ошибок: разбирай только то, что действительно неверно.
+- Если ошибок нет — напиши ровно: Отлично!
+- Если ученик говорит/пишет не по-арабски, вежливо предложи арабский вариант его фразы.
+
+Никакого текста вне меток AR/RU/FIX.
+Пиши арабский текст ТОЛЬКО арабскими буквами и арабской пунктуацией — никогда не вставляй латинские буквы, цифры или транслитерацию внутрь арабской фразы.`;
 }
 
 async function sendUser(text) {
@@ -380,7 +399,7 @@ async function sendUser(text) {
     s.remove();
     messages.push({ role: 'assistant', content: reply });
     const p = parseReply(reply);
-    addMsg('assistant', p.ar, p.ru, p.fix);
+    addMsg('assistant', p.ar, p.ru, p.fix, p.ok);
     const dt = ((performance.now() - t0) / 1000).toFixed(1);
     const m = status(`готово за ${dt} c`, 'good');
     setTimeout(() => m.remove(), 1500);
