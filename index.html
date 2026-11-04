@@ -27,6 +27,10 @@
     width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #33415c;
     background: var(--panel2); color: var(--text); font-size: 1rem;
   }
+  #settings input[type="checkbox"] { width: auto; padding: 0; margin: 0; accent-color: var(--accent); }
+  .switch { display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; }
+  .switch.inline { font-size: .85rem; color: var(--muted); margin: 0; }
+  .switch input { width: auto; }
   .hint { font-size: .78rem; color: var(--muted); margin-top: 4px; }
   button {
     background: var(--accent); color: #06281f; border: none; border-radius: 8px;
@@ -99,6 +103,11 @@
     <label for="voice">Голос (арабский TTS)</label>
     <select id="voice"></select>
 
+    <label class="switch" for="tashkeelSet">
+      <input type="checkbox" id="tashkeelSet">
+      Огласовки (харакаты) в арабском тексте
+    </label>
+
     <div style="margin-top:14px; display:flex; gap:10px; flex-wrap:wrap;">
       <button id="startBtn">Начать разговор</button>
       <button id="diagBtn" class="secondary">Проверить микрофон</button>
@@ -116,6 +125,9 @@
       <button id="sendVoiceBtn" class="secondary" disabled title="Отправить распознанную речь">Готово</button>
       <button id="stopBtn" class="secondary">Стоп-речь</button>
       <button id="endBtn" class="secondary">Завершить</button>
+      <label class="switch inline" title="Показывать огласовки в арабском тексте">
+        <input type="checkbox" id="tashkeelChat"> огласовки
+      </label>
       <div id="level"></div>
     </div>
     <div id="textRow">
@@ -137,6 +149,21 @@ $('level').value = localStorage.getItem('ar_level') || 'beginner';
 $('topic').value = localStorage.getItem('ar_topic') || 'free';
 $('level').onchange = () => localStorage.setItem('ar_level', $('level').value);
 $('topic').onchange = () => localStorage.setItem('ar_topic', $('topic').value);
+
+/* ---------- огласовки (харакаты) ---------- */
+let tashkeel = localStorage.getItem('ar_tashkeel') === 'on';
+function syncTashkeelUI() {
+  $('tashkeelSet').checked = tashkeel;
+  $('tashkeelChat').checked = tashkeel;
+}
+function setTashkeel(v) {
+  tashkeel = !!v;
+  localStorage.setItem('ar_tashkeel', tashkeel ? 'on' : 'off');
+  syncTashkeelUI();
+}
+$('tashkeelSet').onchange = e => setTashkeel(e.target.checked);
+$('tashkeelChat').onchange = e => setTashkeel(e.target.checked);
+syncTashkeelUI();
 
 function err(msg, ok) {
   errBox.textContent = msg;
@@ -327,10 +354,15 @@ function addMsg(role, ar, tr, corr, ok) {
 function status(t, cls) { const s = document.createElement('div'); s.className = 'status ' + (cls || ''); s.textContent = t; chat.appendChild(s); chat.scrollTop = chat.scrollHeight; return s; }
 
 /* ---------- разбор ответа модели ---------- */
+const HARAKAT_RE = /[\u064B-\u065F\u0670\u06D6-\u06ED]/g;
+function stripHarakat(s) { return s ? s.replace(HARAKAT_RE, '') : s; }
+
 function parseReply(reply) {
-  const ar = (reply.match(/AR:\s*([\s\S]*?)(?:RU:|FIX:|$)/) || [])[1]?.trim() || reply;
+  let ar = (reply.match(/AR:\s*([\s\S]*?)(?:RU:|FIX:|$)/) || [])[1]?.trim() || reply;
   const ru = (reply.match(/RU:\s*([\s\S]*?)(?:FIX:|$)/) || [])[1]?.trim();
-  const fixRaw = (reply.match(/FIX:\s*([\s\S]*)/) || [])[1]?.trim() || '';
+  let fixRaw = (reply.match(/FIX:\s*([\s\S]*)/) || [])[1]?.trim() || '';
+  // Страховка: если огласовки выключены, убираем харакаты даже если модель их добавила.
+  if (!tashkeel) { ar = stripHarakat(ar); fixRaw = stripHarakat(fixRaw); }
   const ok = /^отлично/i.test(fixRaw);
   return { ar, ru, fix: fixRaw || null, ok };
 }
@@ -385,7 +417,10 @@ FIX: <разбор ошибок в последней фразе ученика>
 - Если ученик говорит/пишет не по-арабски, вежливо предложи арабский вариант его фразы.
 
 Никакого текста вне меток AR/RU/FIX.
-Пиши арабский текст ТОЛЬКО арабскими буквами и арабской пунктуацией — никогда не вставляй латинские буквы, цифры или транслитерацию внутрь арабской фразы.`;
+Пиши арабский текст ТОЛЬКО арабскими буквами и арабской пунктуацией — никогда не вставляй латинские буквы, цифры или транслитерацию внутрь арабской фразы.
+${tashkeel
+    ? 'ОГЛАСОВКИ ВКЛЮЧЕНЫ: пиши все арабские слова (в AR и в примерах внутри FIX) с ПОЛНОЙ огласовкой — фатха, кясра, дамма, сукун, шадда, танвин.'
+    : 'ОГЛАСОВКИ ВЫКЛЮЧЕНЫ: пиши арабский текст БЕЗ огласовок (без харакат), только буквы.'}`;
 }
 
 async function sendUser(text) {
