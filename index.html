@@ -61,7 +61,7 @@
   }
   #micBtn.listening { background: #ff6b6b; color: #fff; animation: pulse 1.2s infinite; }
   @keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(255,107,107,.5);} 50% { box-shadow: 0 0 0 16px rgba(255,107,107,0);} }
-  #level { color: var(--muted); font-size: .9rem; width: 100%; text-align: center; min-height: 1.3em; margin-top: 6px; }
+  #micStatus { color: var(--muted); font-size: .9rem; width: 100%; text-align: center; min-height: 1.3em; margin-top: 6px; }
   #textRow { display: flex; gap: 8px; margin-top: 12px; }
   #textIn {
     flex: 1; padding: 10px 12px; border-radius: 8px; border: 1px solid #33415c;
@@ -123,17 +123,19 @@
     <div id="controls">
       <button id="micBtn" title="Нажмите и говорите">🎙</button>
       <button id="sendVoiceBtn" class="secondary" disabled title="Отправить распознанную речь">Готово</button>
+      <button id="langBtn" class="secondary" title="Язык распознавания речи">Язык: ар</button>
       <button id="stopBtn" class="secondary">Стоп-речь</button>
       <button id="endBtn" class="secondary">Завершить</button>
       <label class="switch inline" title="Показывать огласовки в арабском тексте">
         <input type="checkbox" id="tashkeelChat"> огласовки
       </label>
-      <div id="level"></div>
+      <div id="micStatus"></div>
     </div>
     <div id="textRow">
-      <input id="textIn" placeholder="Или введите фразу по-арабски (можно без огласовок) и нажмите Enter…" />
+      <input id="textIn" placeholder="Введите фразу по-арабски или спросите по-русски (например: как сказать «я хочу кофе»?) и нажмите Enter…" />
       <button id="sendText" class="secondary">Отправить</button>
     </div>
+    <div class="hint" style="margin-top:10px; text-align:center;">Запнулись? Спросите по-русски — тренажёр подскажет, как сказать это по-арабски. Голосом можно тоже: переключите язык микрофона на «рус».</div>
   </section>
 </main>
 
@@ -205,6 +207,12 @@ function speak(text, cb) {
 /* ---------- STT (push-to-talk: говорим в своём темпе) ---------- */
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 const AR_LANGS = ['ar-SA', 'ar', 'ar-EG', 'ar-AE', 'ar-XA', 'ar-JO', 'ar-LB'];
+const RU_LANGS = ['ru-RU', 'ru'];
+
+// Язык распознавания речи: 'ar' (основной режим) или 'ru' (когда ученик
+// запнулся и спрашивает по-русски, как сказать фразу по-арабски).
+let micLang = localStorage.getItem('ar_miclang') === 'ru' ? 'ru' : 'ar';
+function langsFor(mode) { return mode === 'ru' ? RU_LANGS : AR_LANGS; }
 
 let sessionActive = false;   // идёт ли сессия записи
 let base = '';               // текст, зафиксированный в предыдущих запусках движка
@@ -219,9 +227,10 @@ function joinText(a, b) { return [a, b].map(s => (s || '').trim()).filter(Boolea
 function currentText() { return joinText(base, local); }
 function commitLocal() { base = joinText(base, local); local = ''; }
 
-async function pickArabicLang() {
-  if (!SR || !SR.available) return AR_LANGS[0];
-  for (const l of AR_LANGS) {
+async function pickLang(mode) {
+  const list = langsFor(mode);
+  if (!SR || !SR.available) return list[0];
+  for (const l of list) {
     try {
       const st = await SR.available({ langs: [l] });
       if (st === 'available') return l;
@@ -232,9 +241,10 @@ async function pickArabicLang() {
 
 function renderTranscript() {
   const shown = currentText();
-  $('level').textContent = shown
-    ? '🎤 ' + shown + '  ·  нажмите 🎙 или «Готово», чтобы отправить'
-    : '🎤 Слушаю… говорите в своём темпе (паузы можно делать). Нажмите 🎙, когда закончите.';
+  const tag = micLang === 'ru' ? '🇷🇺 русский' : '🇸🇦 арабский';
+  $('micStatus').textContent = shown
+    ? '🎤 [' + tag + '] ' + shown + '  ·  нажмите 🎙 или «Готово», чтобы отправить'
+    : '🎤 Слушаю [' + tag + ']… говорите в своём темпе (паузы можно делать). Нажмите 🎙, когда закончите.';
   const btn = $('sendVoiceBtn');
   if (btn) btn.disabled = !shown;
 }
@@ -267,11 +277,14 @@ function startEngine() {
   r.onerror = e => {
     if (myId !== engineSeq) return;
     if (e.error === 'language-not-supported') {
-      const idx = AR_LANGS.indexOf(curLang);
-      const next = AR_LANGS[(idx + 1) % AR_LANGS.length];
+      const list = langsFor(micLang);
+      const idx = list.indexOf(curLang);
+      const next = list[(idx + 1) % list.length];
       if (next !== curLang) { curLang = next; safeRestart(); return; }
       stopSession(false);
-      err('В этом браузере нет арабского распознавания. Введите фразу в поле ниже.');
+      err(micLang === 'ru'
+        ? 'В этом браузере нет русского распознавания. Введите вопрос в поле ниже.'
+        : 'В этом браузере нет арабского распознавания. Введите фразу в поле ниже.');
       return;
     }
     if (e.error === 'not-allowed') { stopSession(false); err('Нет доступа к микрофону. Разрешите его в настройках браузера.'); return; }
@@ -292,9 +305,12 @@ function startEngine() {
 async function startSession() {
   speechSynthesis.cancel();
   if (!SR) { err('Браузер не поддерживает распознавание речи. Используйте Chrome/Edge или введите фразу в поле ниже.'); return; }
-  const lang = await pickArabicLang();
+  const mode = micLang;
+  const lang = await pickLang(mode);
   if (!lang) {
-    err('В этом браузере нет арабского распознавания речи. Введите фразу в поле ниже или откройте тренажёр в Chrome/Edge.');
+    err(mode === 'ru'
+      ? 'В этом браузере нет русского распознавания речи. Введите вопрос в поле ниже или откройте тренажёр в Chrome/Edge.'
+      : 'В этом браузере нет арабского распознавания речи. Введите фразу в поле ниже или откройте тренажёр в Chrome/Edge.');
     return;
   }
   curLang = lang; base = ''; local = ''; noSpeechCount = 0; sessionActive = true;
@@ -317,7 +333,7 @@ function stopSession(send) {
     const text = currentText();
     base = ''; local = '';
     engineSeq++;                   // после отправки игнорируем любые «хвостовые» события
-    $('level').textContent = '';
+    $('micStatus').textContent = '';
     const btn = $('sendVoiceBtn');
     if (btn) btn.disabled = true;
     if (send && text) sendUser(text);
@@ -333,6 +349,26 @@ $('micBtn').onclick = () => {
 };
 $('sendVoiceBtn').onclick = () => stopSession(true);
 
+/* Переключение языка распознавания речи: арабский ↔ русский. */
+function updateLangBtn() {
+  const el = $('langBtn');
+  el.textContent = micLang === 'ru' ? 'Язык: рус' : 'Язык: ар';
+  el.title = micLang === 'ru'
+    ? 'Распознавание речи: русский. Нажмите, чтобы переключить на арабский.'
+    : 'Распознавание речи: арабский. Нажмите, чтобы спросить по-русски.';
+}
+$('langBtn').onclick = () => {
+  micLang = micLang === 'ru' ? 'ar' : 'ru';
+  localStorage.setItem('ar_miclang', micLang);
+  updateLangBtn();
+  if (sessionActive) {
+    // Текущая запись сбрасывается — начинаем слушать уже на новом языке.
+    stopSession(false);
+    startSession();
+  }
+};
+updateLangBtn();
+
 /* ---------- chat UI ---------- */
 function addMsg(role, ar, tr, corr, ok) {
   const d = document.createElement('div');
@@ -340,7 +376,14 @@ function addMsg(role, ar, tr, corr, ok) {
   d.innerHTML = `<div class="ar"></div>` +
     (tr ? `<div class="tr"></div>` : '') +
     (corr ? `<div class="corr"></div>` : '');
-  d.querySelector('.ar').textContent = ar;
+  const aEl = d.querySelector('.ar');
+  aEl.textContent = ar;
+  // Русский (и любой неарабский) текст показываем слева направо.
+  if (!/[\u0600-\u06FF]/.test(ar || '')) {
+    aEl.style.direction = 'ltr';
+    aEl.style.textAlign = 'left';
+    aEl.style.fontFamily = '"Segoe UI", Tahoma, sans-serif';
+  }
   if (tr) d.querySelector('.tr').textContent = 'Перевод: ' + tr;
   if (corr) {
     const c = d.querySelector('.corr');
@@ -413,8 +456,15 @@ FIX: <разбор ошибок в последней фразе ученика>
   • Порядок слов / предлоги / артикль / род / число / падеж — так же, если применимо.
 - Пояснения — по-русски, коротко и понятно. Указывай только проблемные места, не переписывай всю фразу, если она верна.
 - Не выдумывай ошибок: разбирай только то, что действительно неверно.
-- Если ошибок нет — напиши ровно: Отлично!
-- Если ученик говорит/пишет не по-арабски, вежливо предложи арабский вариант его фразы.
+- Если ошибок нет (и это не запрос помощи по-русски) — напиши ровно: Отлично!
+- СМЕШАННЫЙ РЕЖИМ (арабский + русский): ученик может писать или говорить по-русски — особенно когда не знает, как сказать фразу по-арабски. Это нормально и НЕ является ошибкой; на русскую фразу в FIX не жалуйся.
+- Если последняя фраза ученика на русском (целиком или в основном) — считай это просьбой о помощи:
+  • AR: дай РОВНО ту фразу по-арабски (1–2 коротких варианта), которую ученик хотел сказать, — естественно для фусхи, по его уровню.
+  • RU: русский перевод этой фразы + очень короткое пояснение (1–2 предложения): какие слово/конструкция нужны и почему.
+  • FIX: оставь пустым (после «FIX:» ничего не пиши).
+  • После этого, если уместно, задай встречный вопрос по-арабски, чтобы продолжить беседу.
+- Если фраза смешанная (русский + арабский, например «я хочу أكل»), собери полную арабскую фразу: AR — готовый вариант, RU — перевод, FIX — короткое пояснение по-русски о том, что заменено.
+- Блок AR — ТОЛЬКО арабский текст; русские слова и пояснения в него никогда не попадают.
 
 Никакого текста вне меток AR/RU/FIX.
 Пиши арабский текст ТОЛЬКО арабскими буквами и арабской пунктуацией — никогда не вставляй латинские буквы, цифры или транслитерацию внутрь арабской фразы.
@@ -424,7 +474,7 @@ ${tashkeel
 }
 
 async function sendUser(text) {
-  $('level').textContent = '';
+  $('micStatus').textContent = '';
   addMsg('user', text);
   messages.push({ role: 'user', content: text });
   const s = status('Думаю…');
@@ -489,14 +539,19 @@ $('textIn').addEventListener('keydown', e => { if (e.key === 'Enter') sendTyped(
 $('diagBtn').onclick = async () => {
   const out = $('diagOut');
   if (!SR) { out.textContent = 'Распознавание речи: НЕ поддерживается этим браузером.'; return; }
-  out.textContent = 'Проверяю поддержку арабского распознавания…';
+  out.textContent = 'Проверяю поддержку распознавания…';
   if (!SR.available) { out.textContent = 'Браузер поддерживает распознавание, но не умеет проверять языки (старая версия).'; return; }
-  const parts = [];
-  for (const l of AR_LANGS) {
-    try { parts.push(l + ' — ' + await SR.available({ langs: [l] })); }
-    catch (e) { parts.push(l + ' — ошибка'); }
-  }
-  out.textContent = 'Поддержка арабского: ' + parts.join('; ');
+  const check = async (list) => {
+    const parts = [];
+    for (const l of list) {
+      try { parts.push(l + ' — ' + await SR.available({ langs: [l] })); }
+      catch (e) { parts.push(l + ' — ошибка'); }
+    }
+    return parts.join('; ');
+  };
+  const ar = await check(AR_LANGS);
+  const ru = await check(RU_LANGS);
+  out.textContent = 'Арабский: ' + ar + '  |  Русский: ' + ru;
 };
 
 if (navigator.mediaDevices) navigator.mediaDevices.getUserMedia({ audio: true }).catch(() => {});
