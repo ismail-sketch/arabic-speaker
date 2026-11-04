@@ -1,0 +1,11 @@
+# секреты
+.env
+.env.local
+
+# зависимости
+node_modules/
+
+# служебное
+*.log
+.DS_Store
+Thumbs.db

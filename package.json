@@ -1,0 +1,10 @@
+{
+  "name": "arabic-speaker",
+  "version": "1.0.0",
+  "description": "Голосовой тренажёр разговорного арабского (фусха): распознавание речи, диалог с LLM и озвучка ответов",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "license": "MIT"
+}
