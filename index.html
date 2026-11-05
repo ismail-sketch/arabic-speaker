@@ -135,7 +135,7 @@
       <input id="textIn" placeholder="Введите фразу по-арабски или спросите по-русски (например: как сказать «я хочу кофе»?) и нажмите Enter…" />
       <button id="sendText" class="secondary">Отправить</button>
     </div>
-    <div class="hint" style="margin-top:10px; text-align:center;">Запнулись? Спросите по-русски — тренажёр подскажет, как сказать это по-арабски. Голосом можно тоже: переключите язык микрофона на «рус».</div>
+    <div class="hint" style="margin-top:10px; text-align:center;">Запнулись посреди фразы? Нажмите «Язык: ар» → «Язык: рус» и договорите по-русски, не останавливая запись — сказанное по-арабски сохранится и уйдёт вместе с русским. Текст в поле ниже во время записи тоже дописывается к сказанному.</div>
   </section>
 </main>
 
@@ -215,6 +215,7 @@ let micLang = localStorage.getItem('ar_miclang') === 'ru' ? 'ru' : 'ar';
 function langsFor(mode) { return mode === 'ru' ? RU_LANGS : AR_LANGS; }
 
 let sessionActive = false;   // идёт ли сессия записи
+let sessionStartLang = null; // язык, с которого началась текущая запись
 let base = '';               // текст, зафиксированный в предыдущих запусках движка
 let local = '';              // полный текст текущего запуска (финальный + промежуточный)
 let curLang = null;          // текущая арабская локаль
@@ -241,10 +242,14 @@ async function pickLang(mode) {
 
 function renderTranscript() {
   const shown = currentText();
-  const tag = micLang === 'ru' ? '🇷🇺 русский' : '🇸🇦 арабский';
+  // Пока идёт запись, показываем язык, на котором слушаем СЕЙЧАС.
+  const mode = sessionActive ? micLang : (sessionStartLang || micLang);
+  const tag = mode === 'ru' ? '🇷🇺 русский' : '🇸🇦 арабский';
+  const mix = sessionActive && sessionStartLang && sessionStartLang !== micLang
+    ? ' (смешанная фраза)' : '';
   $('micStatus').textContent = shown
-    ? '🎤 [' + tag + '] ' + shown + '  ·  нажмите 🎙 или «Готово», чтобы отправить'
-    : '🎤 Слушаю [' + tag + ']… говорите в своём темпе (паузы можно делать). Нажмите 🎙, когда закончите.';
+    ? '🎤 [' + tag + mix + '] ' + shown + '  ·  нажмите 🎙 или «Готово», чтобы отправить'
+    : '🎤 Слушаю [' + tag + mix + ']… говорите в своём темпе (паузы можно делать). Нажмите 🎙, когда закончите.';
   const btn = $('sendVoiceBtn');
   if (btn) btn.disabled = !shown;
 }
@@ -258,9 +263,10 @@ function safeRestart() {
 function startEngine() {
   if (!sessionActive) return;
   const myId = ++engineSeq;      // помечаем этот движок как актуальный
+  const lang = curLang;          // язык именно этого движка (защита от смены на лету)
   local = '';                    // каждый запуск движка копит свой локальный буфер
   const r = new SR();
-  r.lang = curLang;
+  r.lang = lang;
   r.interimResults = true;
   r.continuous = true;           // не обрывать на паузах
   r.onstart = () => { listening = true; };
@@ -277,12 +283,13 @@ function startEngine() {
   r.onerror = e => {
     if (myId !== engineSeq) return;
     if (e.error === 'language-not-supported') {
-      const list = langsFor(micLang);
-      const idx = list.indexOf(curLang);
+      // Перебираем локали того языка, на котором запущен ИМЕННО этот движок.
+      const list = langsFor(String(lang).startsWith('ru') ? 'ru' : 'ar');
+      const idx = list.indexOf(lang);
       const next = list[(idx + 1) % list.length];
-      if (next !== curLang) { curLang = next; safeRestart(); return; }
+      if (next !== lang) { curLang = next; safeRestart(); return; }
       stopSession(false);
-      err(micLang === 'ru'
+      err(lang.startsWith('ru')
         ? 'В этом браузере нет русского распознавания. Введите вопрос в поле ниже.'
         : 'В этом браузере нет арабского распознавания. Введите фразу в поле ниже.');
       return;
@@ -314,6 +321,7 @@ async function startSession() {
     return;
   }
   curLang = lang; base = ''; local = ''; noSpeechCount = 0; sessionActive = true;
+  sessionStartLang = mode;
   $('micBtn').classList.add('listening');
   $('micBtn').title = 'Идёт запись — нажмите, чтобы отправить';
   renderTranscript();
@@ -336,7 +344,13 @@ function stopSession(send) {
     $('micStatus').textContent = '';
     const btn = $('sendVoiceBtn');
     if (btn) btn.disabled = true;
-    if (send && text) sendUser(text);
+    if (send && text) {
+      // Если по-русски спрашивали «на ходу» посреди арабской фразы,
+      // после отправки возвращаемся к языку, с которого начали запись.
+      if (sessionStartLang && micLang !== sessionStartLang) setMicLang(sessionStartLang);
+      sendUser(text);
+    }
+    sessionStartLang = null;
   };
   // Небольшая задержка, чтобы браузер успел финализировать последние слова.
   if (wasActive && send) setTimeout(finish, 600);
@@ -349,41 +363,91 @@ $('micBtn').onclick = () => {
 };
 $('sendVoiceBtn').onclick = () => stopSession(true);
 
-/* Переключение языка распознавания речи: арабский ↔ русский. */
+/* ---------- переключение языка распознавания речи ----------
+ * Главное: переключение НЕ обрывает запись и НЕ стирает уже сказанное.
+ * Арабский текст остаётся в буфере (base), новый движок слушает на другом
+ * языке и дописывает своё — получается одна смешанная фраза. */
+function setMicLang(mode) {
+  micLang = mode;
+  localStorage.setItem('ar_miclang', micLang);
+  updateLangBtn();
+}
+
 function updateLangBtn() {
   const el = $('langBtn');
   el.textContent = micLang === 'ru' ? 'Язык: рус' : 'Язык: ар';
   el.title = micLang === 'ru'
-    ? 'Распознавание речи: русский. Нажмите, чтобы переключить на арабский.'
-    : 'Распознавание речи: арабский. Нажмите, чтобы спросить по-русски.';
+    ? 'Слушаю по-русски. Нажмите, чтобы вернуться к арабскому (сказанное сохранится).'
+    : 'Слушаю по-арабски. Нажмите, чтобы добавить вопрос по-русски, не теряя арабский текст.';
 }
-$('langBtn').onclick = () => {
-  micLang = micLang === 'ru' ? 'ar' : 'ru';
-  localStorage.setItem('ar_miclang', micLang);
-  updateLangBtn();
-  if (sessionActive) {
-    // Текущая запись сбрасывается — начинаем слушать уже на новом языке.
+
+// Перезапуск движка на другом языке с сохранением уже распознанного.
+async function switchLangLive() {
+  clearTimeout(restartTimer);
+  commitLocal();                 // всё, что успело распознаться, уходит в base
+  engineSeq++;                   // сначала отцепляем старый движок: его события больше не нужны
+  try { engine && engine.abort(); } catch (e) { /* ignore */ }  // abort: не отдаём хвост старого языка
+  local = '';
+  if (!sessionActive) { renderTranscript(); return; }
+  const lang = await pickLang(micLang);
+  if (!sessionActive) return;    // успели нажать «Готово», пока проверяли язык
+  if (!lang) {
     stopSession(false);
-    startSession();
+    err(micLang === 'ru'
+      ? 'В этом браузере нет русского распознавания. Введите вопрос в поле ниже.'
+      : 'В этом браузере нет арабского распознавания. Введите фразу в поле ниже.');
+    return;
   }
+  curLang = lang;                // новый движок стартует уже на нужном языке
+  startEngine();
+  renderTranscript();
+}
+
+$('langBtn').onclick = () => {
+  setMicLang(micLang === 'ru' ? 'ar' : 'ru');
+  if (sessionActive) switchLangLive();
 };
 updateLangBtn();
 
 /* ---------- chat UI ---------- */
+const AR_CHAR = /[\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF]/;
+const AR_RUN_RE = /[\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF][\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF\s،؟.…!]*|[^\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF]+/g;
+
+// Вывод сообщения: русский текст — слева направо, арабский — справа налево,
+// смешанный — каждый кусок в своём направлении (иначе вставки «прыгают»).
+function renderMessageText(el, text) {
+  text = text || '';
+  el.textContent = '';
+  const hasAr = AR_CHAR.test(text);
+  const hasWords = /[A-Za-zА-Яа-яЁё]/.test(text);
+  if (!hasAr) {
+    el.textContent = text;
+    el.style.direction = 'ltr';
+    el.style.textAlign = 'left';
+    el.style.fontFamily = '"Segoe UI", Tahoma, sans-serif';
+    return;
+  }
+  if (!hasWords) { el.textContent = text; return; }
+  const rtl = AR_CHAR.test(text.trim()[0] || '');
+  el.style.direction = rtl ? 'rtl' : 'ltr';
+  el.style.textAlign = rtl ? 'right' : 'left';
+  for (const run of text.match(AR_RUN_RE) || [text]) {
+    const span = document.createElement('span');
+    const isAr = AR_CHAR.test(run);
+    span.dir = isAr ? 'rtl' : 'ltr';
+    if (!isAr) span.style.fontFamily = '"Segoe UI", Tahoma, sans-serif';
+    span.textContent = run;
+    el.appendChild(span);
+  }
+}
+
 function addMsg(role, ar, tr, corr, ok) {
   const d = document.createElement('div');
   d.className = 'msg ' + (role === 'assistant' ? 'bot' : 'user');
   d.innerHTML = `<div class="ar"></div>` +
     (tr ? `<div class="tr"></div>` : '') +
     (corr ? `<div class="corr"></div>` : '');
-  const aEl = d.querySelector('.ar');
-  aEl.textContent = ar;
-  // Русский (и любой неарабский) текст показываем слева направо.
-  if (!/[\u0600-\u06FF]/.test(ar || '')) {
-    aEl.style.direction = 'ltr';
-    aEl.style.textAlign = 'left';
-    aEl.style.fontFamily = '"Segoe UI", Tahoma, sans-serif';
-  }
+  renderMessageText(d.querySelector('.ar'), ar);
   if (tr) d.querySelector('.tr').textContent = 'Перевод: ' + tr;
   if (corr) {
     const c = d.querySelector('.corr');
@@ -458,6 +522,10 @@ FIX: <разбор ошибок в последней фразе ученика>
 - Не выдумывай ошибок: разбирай только то, что действительно неверно.
 - Если ошибок нет (и это не запрос помощи по-русски) — напиши ровно: Отлично!
 - СМЕШАННЫЙ РЕЖИМ (арабский + русский): ученик может писать или говорить по-русски — особенно когда не знает, как сказать фразу по-арабски. Это нормально и НЕ является ошибкой; на русскую фразу в FIX не жалуйся.
+- Фраза ученика может быть СМЕШАННОЙ прямо в одном сообщении (сказал по-арабски, запнулся и добавил по-русски). Понимай её как одну мысль:
+  • AR: закончи мысль ученика по-арабски — одна естественная фраза, собранная из арабской части и русского уточнения.
+  • RU: перевод получившейся фразы + короткое пояснение, как по-арабски сказать русскую часть.
+  • FIX: разбери только реальные ошибки в арабской части; русскую часть не считай ошибкой.
 - Если последняя фраза ученика на русском (целиком или в основном) — считай это просьбой о помощи:
   • AR: дай РОВНО ту фразу по-арабски (1–2 коротких варианта), которую ученик хотел сказать, — естественно для фусхи, по его уровню.
   • RU: русский перевод этой фразы + очень короткое пояснение (1–2 предложения): какие слово/конструкция нужны и почему.
@@ -530,6 +598,14 @@ function sendTyped() {
   const v = $('textIn').value.trim();
   if (!v) return;
   $('textIn').value = '';
+  // Если сейчас идёт запись — текст добавляется к сказанному, а не отправляется
+  // отдельно: так можно на ходу вписать русское уточнение к арабской фразе.
+  if (sessionActive) {
+    commitLocal();
+    base = joinText(base, v);
+    renderTranscript();
+    return;
+  }
   sendUser(v);
 }
 $('sendText').onclick = sendTyped;
