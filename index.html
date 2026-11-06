@@ -72,6 +72,40 @@
   .errbox { background: #3a1f1f; border: 1px solid var(--err); color: var(--err);
     padding: 10px 14px; border-radius: 8px; margin-bottom: 12px; font-size: .9rem; }
   .meta { font-size: .72rem; color: var(--muted); margin-top: 2px; }
+
+  /* итог занятия */
+  .sumMeta { color: var(--muted); font-size: .85rem; margin: 4px 0 14px; }
+  .sumCard { background: var(--panel); border-radius: 12px; padding: 14px 16px; margin-bottom: 12px; }
+  .sumCard h3 { margin: 0 0 8px; font-size: 1rem; color: var(--accent); }
+  .sumCard p { margin: 0; line-height: 1.55; }
+  .sumList { margin: 0; padding-left: 18px; line-height: 1.55; }
+  .sumList li { margin-bottom: 6px; }
+  .wordRow { display: flex; gap: 10px; align-items: baseline; padding: 6px 0; border-bottom: 1px solid #2a3550; flex-wrap: wrap; }
+  .wordRow:last-child { border-bottom: none; }
+  .wordRow .ar { direction: rtl; font-size: 1.1rem; }
+  .wordRow .ru { color: var(--muted); font-size: .9rem; flex: 1; min-width: 140px; }
+  .wordRow .cnt { font-size: .75rem; color: var(--accent); white-space: nowrap; }
+  .wordRow .why { flex-basis: 100%; color: var(--muted); font-size: .78rem; margin-top: -2px; }
+  .sumActions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+  .sumSaved { color: var(--accent); font-size: .8rem; margin-top: 8px; min-height: 1.2em; }
+  .empty { color: var(--muted); font-size: .85rem; font-style: italic; }
+
+  /* история и словарик */
+  .histBox { margin-top: 22px; border-top: 1px solid #2a3550; padding-top: 14px; }
+  .histHead { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin: 8px 0; }
+  .histHead h2 { margin: 0; font-size: 1.05rem; }
+  button.small { padding: 6px 10px; font-size: .8rem; font-weight: 500; }
+  .histList, .vocabList { display: flex; flex-direction: column; gap: 8px; }
+  .histRow { display: flex; align-items: center; gap: 10px; background: var(--panel2); border-radius: 8px; padding: 8px 10px; font-size: .85rem; flex-wrap: wrap; }
+  .histRow .when { font-weight: 600; }
+  .histRow .meta2 { color: var(--muted); flex: 1; min-width: 120px; }
+  .histRow button { padding: 5px 10px; font-size: .78rem; }
+  .vocabRow { display: flex; align-items: center; gap: 10px; background: var(--panel2); border-radius: 8px; padding: 8px 10px; flex-wrap: wrap; }
+  .vocabRow .ar { direction: rtl; font-size: 1.05rem; }
+  .vocabRow .ru { color: var(--muted); font-size: .85rem; flex: 1; min-width: 110px; }
+  .vocabRow .cnt { font-size: .75rem; color: var(--accent); }
+  .vocabRow button { padding: 5px 10px; font-size: .78rem; }
+  .vocabRow.known .ar, .vocabRow.known .ru { opacity: .55; }
 </style>
 </head>
 <body>
@@ -114,6 +148,19 @@
     </div>
     <div class="meta" id="diagOut"></div>
     <div class="meta">Модель: gc/gemini-2.5-flash (через AnyModel)</div>
+
+    <div class="histBox">
+      <div class="histHead">
+        <h2>История занятий</h2>
+        <button id="clearHistBtn" class="secondary small">Очистить</button>
+      </div>
+      <div id="histList" class="histList"></div>
+      <div class="histHead" style="margin-top:18px;">
+        <h2>Словарик</h2>
+        <button id="clearVocabBtn" class="secondary small">Очистить</button>
+      </div>
+      <div id="vocabList" class="vocabList"></div>
+    </div>
   </section>
 
   <div id="err" class="errbox hidden"></div>
@@ -137,12 +184,28 @@
     </div>
     <div class="hint" style="margin-top:10px; text-align:center;">Запнулись посреди фразы? Нажмите «Язык: ар» → «Язык: рус» и договорите по-русски, не останавливая запись — сказанное по-арабски сохранится и уйдёт вместе с русским. Текст в поле ниже во время записи тоже дописывается к сказанному.</div>
   </section>
+
+  <section id="summarySection" class="hidden">
+    <h2 style="margin:0 0 4px; font-size:1.25rem;">Итог занятия</h2>
+    <div class="sumMeta" id="sumMeta"></div>
+    <div id="sumBody"></div>
+    <div class="sumActions">
+      <button id="sumAiBtn" class="secondary">Улучшить разбор ИИ</button>
+      <button id="sumMdBtn" class="secondary">Скачать .md</button>
+      <button id="sumCloseBtn">Закрыть</button>
+    </div>
+    <div class="sumSaved" id="sumSaved"></div>
+  </section>
 </main>
 
 <script>
 const $ = id => document.getElementById(id);
 const chat = $('chat'), errBox = $('err');
 let messages = [];           // история для API (формат OpenAI)
+let sessionEntries = [];     // реплики текущего занятия в удобном виде (для итога)
+let sessionStartedAt = 0;    // время начала занятия
+let sessionTopic = 'free', sessionLevel = 'beginner';
+let currentSummary = null;   // итог, открытый на экране
 let recognition = null, listening = false;
 let voices = [];
 
@@ -474,20 +537,20 @@ function parseReply(reply) {
   return { ar, ru, fix: fixRaw || null, ok };
 }
 
-/* ---------- запрос к локальному прокси (AnyModel → DeepSeek) ---------- */
-async function callModel() {
+/* ---------- запрос к локальному прокси (AnyModel) ---------- */
+async function apiChat(msgs, { temperature = 0.5, max_tokens = 700 } = {}) {
   const resp = await fetch('/api/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      messages: [{ role: 'system', content: systemPrompt() }, ...messages],
-      temperature: 0.5,
-      max_tokens: 700,
-    }),
+    body: JSON.stringify({ messages: msgs, temperature, max_tokens }),
   });
   const data = await resp.json();
   if (!resp.ok) throw new Error(data.error?.message || data.error || ('Ошибка API ' + resp.status));
   return data.choices?.[0]?.message?.content || '';
+}
+
+async function callModel() {
+  return apiChat([{ role: 'system', content: systemPrompt() }, ...messages]);
 }
 
 function systemPrompt() {
@@ -545,6 +608,7 @@ async function sendUser(text) {
   $('micStatus').textContent = '';
   addMsg('user', text);
   messages.push({ role: 'user', content: text });
+  sessionEntries.push({ role: 'user', text });
   const s = status('Думаю…');
   const t0 = performance.now();
   try {
@@ -552,6 +616,7 @@ async function sendUser(text) {
     s.remove();
     messages.push({ role: 'assistant', content: reply });
     const p = parseReply(reply);
+    sessionEntries.push({ role: 'assistant', ar: p.ar, ru: p.ru, fix: p.fix, ok: p.ok });
     addMsg('assistant', p.ar, p.ru, p.fix, p.ok);
     const dt = ((performance.now() - t0) / 1000).toFixed(1);
     const m = status(`готово за ${dt} c`, 'good');
@@ -563,11 +628,456 @@ async function sendUser(text) {
   }
 }
 
+/* ============ итог занятия: сводка, история, словарик, экспорт ============ */
+
+const LS_SESSIONS = 'ar_sessions';
+const LS_VOCAB = 'ar_vocab';
+const MAX_SESSIONS = 20;
+const TOPIC_LABELS = {
+  free: 'Свободная беседа', cafe: 'В кафе / ресторане', market: 'На рынке / покупки',
+  travel: 'Путешествия / такси / отель', work: 'Работа и учёба', daily: 'Повседневная жизнь',
+};
+const LEVEL_LABELS = { beginner: 'Начинающий', intermediate: 'Средний', advanced: 'Продвинутый' };
+
+function loadJson(key, def) {
+  try { const v = JSON.parse(localStorage.getItem(key)); return v == null ? def : v; }
+  catch (e) { return def; }
+}
+function saveJson(key, val) {
+  try { localStorage.setItem(key, JSON.stringify(val)); return true; }
+  catch (e) { return false; }
+}
+function loadSessions() { const v = loadJson(LS_SESSIONS, []); return Array.isArray(v) ? v : []; }
+function saveSessions(list) {
+  const cut = list.slice(0, MAX_SESSIONS);
+  if (saveJson(LS_SESSIONS, cut)) return;
+  // Место в localStorage кончилось — сохраняем без транскриптов.
+  saveJson(LS_SESSIONS, cut.map(s => ({ ...s, transcript: [] })));
+}
+function loadVocab() { const v = loadJson(LS_VOCAB, {}); return v && typeof v === 'object' ? v : {}; }
+
+function isHelpRequest(text) { return /[А-Яа-яЁё]/.test(String(text)); }
+
+function shortRu(ru) {
+  const s = String(ru || '').replace(/^перевод:\s*/i, '').trim();
+  const m = s.match(/^[^.!?]+[.!?]?/);
+  return (m ? m[0] : s).trim();
+}
+
+// Ключ для словарика: без огласовок, с нормализацией персидских/алифных вариантов.
+function vocabKey(ar) {
+  return stripHarakat(String(ar || ''))
+    .replace(/\u0640/g, '')
+    .replace(/ک/g, 'ك').replace(/ی/g, 'ي')
+    .replace(/[أإآٱ]/g, 'ا')
+    .replace(/[^\u0600-\u06FF\s]/g, ' ')
+    .replace(/\s+/g, ' ').trim();
+}
+
+// Локальный итог: ошибки из FIX + фразы, о которых ученик спрашивал по-русски.
+function buildLocalSummary() {
+  const mistakeMap = new Map();
+  const asks = [];
+  const seenA = new Set();
+  for (let i = 0; i < sessionEntries.length; i++) {
+    const e = sessionEntries[i];
+    if (e.role !== 'assistant') continue;
+
+    if (e.fix && !e.ok) {
+      for (const raw of String(e.fix).split(/\r?\n/)) {
+        const t = raw.replace(/^\s*[•\-–—*]\s*/, '').trim();
+        if (!t) continue;
+        const key = t.toLowerCase().replace(/\s+/g, ' ');
+        if (mistakeMap.has(key)) mistakeMap.get(key).count++;
+        else mistakeMap.set(key, { text: t, count: 1 });
+      }
+    }
+
+    const prev = sessionEntries[i - 1];
+    if (prev && prev.role === 'user' && isHelpRequest(prev.text) && e.ar) {
+      const key = vocabKey(e.ar);
+      if (!key || seenA.has(key)) continue;
+      seenA.add(key);
+      asks.push({ ar: e.ar, ru: shortRu(e.ru) });
+    }
+  }
+  return { mistakes: [...mistakeMap.values()], asks };
+}
+
+function mergeVocab(items) {
+  const v = loadVocab();
+  let changed = false;
+  for (const it of items) {
+    const key = vocabKey(it.ar);
+    if (!key) continue;
+    const cur = v[key] || { ar: it.ar, ru: it.ru || '', count: 0, status: 'learn', first: Date.now() };
+    cur.count++;
+    if (it.ru) cur.ru = it.ru;
+    if (it.type === 'word') cur.kind = 'word';
+    cur.last = Date.now();
+    v[key] = cur;
+    changed = true;
+  }
+  if (changed) saveJson(LS_VOCAB, v);
+  return changed;
+}
+
+function finalizeSession() {
+  const userCount = sessionEntries.filter(e => e.role === 'user' && String(e.text || '').trim()).length;
+  if (!userCount) return null;
+
+  const local = buildLocalSummary();
+  const ses = {
+    id: 'ses_' + Date.now(),
+    date: new Date().toISOString(),
+    durationSec: sessionStartedAt ? Math.round((Date.now() - sessionStartedAt) / 1000) : 0,
+    topic: sessionTopic,
+    level: sessionLevel,
+    msgs: sessionEntries.length,
+    mistakes: local.mistakes,
+    asks: local.asks,
+    words: [],
+    advice: '',
+    aiDone: false,
+    transcript: sessionEntries.slice(-120).map(e => e.role === 'user'
+      ? { role: 'user', text: e.text }
+      : { role: 'assistant', ar: e.ar, ru: e.ru, fix: e.fix }),
+  };
+
+  const list = loadSessions();
+  list.unshift(ses);
+  saveSessions(list);
+  mergeVocab(local.asks.map(a => ({ ar: a.ar, ru: a.ru, type: 'phrase' })));
+  return ses;
+}
+
+function updateSession(ses) {
+  const list = loadSessions();
+  const i = list.findIndex(s => s.id === ses.id);
+  if (i >= 0) list[i] = ses; else list.unshift(ses);
+  saveSessions(list);
+}
+
+/* --- отображение --- */
+function el(tag, cls) { const n = document.createElement(tag); if (cls) n.className = cls; return n; }
+function card(title, node) {
+  const c = el('div', 'sumCard');
+  const h = el('h3'); h.textContent = title;
+  c.appendChild(h); c.appendChild(node);
+  return c;
+}
+function textP(t) { const p = el('p'); p.textContent = t; return p; }
+function wordRow(ar, ru, count, why) {
+  const row = el('div', 'wordRow');
+  const a = el('span', 'ar'); a.textContent = ar; a.dir = 'rtl';
+  const r = el('span', 'ru'); r.textContent = ru || '';
+  row.appendChild(a); row.appendChild(r);
+  if (count > 1) { const c = el('span', 'cnt'); c.textContent = '×' + count; row.appendChild(c); }
+  if (why) { const w = el('div', 'why'); w.textContent = why; row.appendChild(w); }
+  return row;
+}
+
+// Ключ для дедупликации ошибок: сравниваем пару «неверно → верно», а не весь текст.
+function mistakeKey(text) {
+  const m = String(text).match(/«([^»]+)»\s*→\s*«([^»]+)»/);
+  if (m) return vocabKey(m[1]) + '→' + vocabKey(m[2]);
+  return String(text).toLowerCase().replace(/^•\s*/, '').replace(/\s+/g, ' ').trim();
+}
+
+function durationText(sec) {
+  sec = Math.max(0, Math.round(sec || 0));
+  if (sec < 60) return sec + ' с';
+  const m = Math.floor(sec / 60), s = sec % 60;
+  return m + ' мин' + (s ? ' ' + s + ' с' : '');
+}
+function dateText(iso) {
+  const d = new Date(iso);
+  return d.toLocaleString('ru-RU', { day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit' });
+}
+function metaLine(ses) {
+  return [dateText(ses.date), durationText(ses.durationSec),
+    TOPIC_LABELS[ses.topic] || ses.topic, LEVEL_LABELS[ses.level] || ses.level,
+    ses.msgs + ' репл.'].join(' · ');
+}
+
+function renderSummary(ses, live) {
+  currentSummary = ses;
+  $('sumMeta').textContent = metaLine(ses);
+  $('sumSaved').textContent = live ? 'Сохранено в историю занятий.' : '';
+  const body = $('sumBody');
+  body.textContent = '';
+
+  if (ses.advice) body.appendChild(card('Совет', textP(ses.advice)));
+
+  const mistakes = ses.mistakes || [];
+  if (mistakes.length) {
+    const ul = el('ul', 'sumList');
+    mistakes.forEach(m => {
+      const li = el('li');
+      li.textContent = String(m.text).replace(/^•\s*/, '') + (m.count > 1 ? '  ×' + m.count : '');
+      ul.appendChild(li);
+    });
+    body.appendChild(card('Ошибки', ul));
+  } else {
+    body.appendChild(card('Ошибки', textP('Ошибок не было — отлично!')));
+  }
+
+  const asks = ses.asks || [], words = ses.words || [];
+  if (asks.length) {
+    const w = el('div');
+    asks.forEach(a => w.appendChild(wordRow(a.ar, shortRu(a.ru), 0)));
+    body.appendChild(card('О чём переспрашивал', w));
+  }
+  if (words.length) {
+    const w = el('div');
+    words.forEach(x => w.appendChild(wordRow(x.ar, x.ru, 0, x.why)));
+    body.appendChild(card('Слова занятия', w));
+  }
+  if (!mistakes.length && !asks.length && !words.length && !ses.advice) {
+    body.appendChild(card('Пока пусто', textP('Поговорите подольше — здесь появятся ошибки и трудные слова.')));
+  }
+
+  const aiBtn = $('sumAiBtn');
+  aiBtn.textContent = ses.aiDone ? 'Разбор ИИ готов ✓' : 'Улучшить разбор ИИ';
+  aiBtn.disabled = !!ses.aiDone || !(ses.transcript && ses.transcript.length);
+}
+
+function showSummary(ses, live) {
+  speechSynthesis.cancel();
+  $('settings').classList.add('hidden');
+  $('chatSection').classList.add('hidden');
+  $('summarySection').classList.remove('hidden');
+  renderSummary(ses, live);
+}
+
+/* --- разбор от модели --- */
+function extractJson(s) {
+  const txt = String(s || '');
+  const fence = txt.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const body = fence ? fence[1] : txt;
+  const a = body.indexOf('{'), b = body.lastIndexOf('}');
+  if (a < 0 || b <= a) throw new Error('Модель вернула ответ не в формате JSON');
+  return JSON.parse(body.slice(a, b + 1));
+}
+
+function transcriptText(entries) {
+  return entries.map(e => {
+    if (e.role === 'user') return 'УЧЕНИК: ' + e.text;
+    let s = 'ТРЕНАЖЁР: ' + (e.ar || '');
+    if (e.ru) s += '\nRU: ' + e.ru;
+    if (e.fix) s += '\nFIX: ' + e.fix;
+    return s;
+  }).join('\n\n');
+}
+
+async function requestAiSummary(ses) {
+  const sys = `Ты — методист по арабскому языку (фусха) и русскоязычный преподаватель.
+Разбери прошедшее занятие ученика. Нужен только СТРОГИЙ JSON без пояснений и без markdown-обёртки:
+{"advice":"...","mistakes":[{"category":"...","wrong":"...","right":"...","note":"..."}],"words":[{"ar":"...","ru":"...","why":"..."}]}
+
+Правила:
+- advice: 2–3 предложения по-русски: что получилось и что тренировать дальше.
+- mistakes: только реальные ошибки ученика из FIX, без выдуманных. Если ошибок нет — пустой массив.
+- words: 5–12 самых полезных слов/выражений именно для этого ученика — о которых он спрашивал, на которых ошибался и ключевых по теме. ar — по-арабски, ru — краткий перевод, why — 3–6 слов по-русски, зачем это слово.
+- В поле ar — только арабский текст.
+- Если занятие совсем короткое, верни короткие массивы, но не выдумывай данные.`;
+
+  const raw = await apiChat([
+    { role: 'system', content: sys },
+    { role: 'user', content: 'Занятие:\n\n' + transcriptText(ses.transcript || []) },
+  ], { temperature: 0.2, max_tokens: 1200 });
+
+  const j = extractJson(raw);
+  const arr = v => Array.isArray(v) ? v : [];
+  return {
+    advice: typeof j.advice === 'string' ? j.advice.trim() : '',
+    mistakes: arr(j.mistakes).map(m => ({
+      category: String(m.category || '').trim(),
+      wrong: String(m.wrong || '').trim(),
+      right: String(m.right || '').trim(),
+      note: String(m.note || '').trim(),
+    })).filter(m => m.wrong || m.right),
+    words: arr(j.words).map(w => ({
+      ar: String(w.ar || '').trim(),
+      ru: String(w.ru || '').trim(),
+      why: String(w.why || '').trim(),
+    })).filter(w => w.ar),
+  };
+}
+
+function mistakeText(m) {
+  const cat = m.category ? m.category + ': ' : '';
+  const pair = ((m.wrong ? '«' + m.wrong + '» ' : '') + (m.right ? '→ «' + m.right + '»' : '')).trim();
+  return '• ' + cat + pair + (m.note ? ' — ' + m.note : '');
+}
+
+$('sumAiBtn').onclick = async () => {
+  const ses = currentSummary;
+  if (!ses || ses.aiDone) return;
+  const btn = $('sumAiBtn');
+  btn.disabled = true;
+  btn.textContent = 'Разбираю…';
+  try {
+    const ai = await requestAiSummary(ses);
+    if (ai.advice) ses.advice = ai.advice;
+    ses.mistakes = ses.mistakes || [];
+    ses.words = ses.words || [];
+    ai.mistakes.forEach(m => {
+      const text = mistakeText(m);
+      const key = mistakeKey(text);
+      if (!ses.mistakes.some(x => mistakeKey(x.text) === key)) ses.mistakes.push({ text, count: 1 });
+    });
+    ses.words = ai.words.map(w => ({ ar: w.ar, ru: w.ru, why: w.why }));
+    ses.aiDone = true;
+    updateSession(ses);
+    mergeVocab(ai.words.map(w => ({ ar: w.ar, ru: w.ru, type: 'word' })));
+    renderSummary(ses, false);
+    $('sumSaved').textContent = 'Разбор ИИ сохранён.';
+    refreshSettingsLists();
+  } catch (e) {
+    btn.disabled = false;
+    btn.textContent = 'Улучшить разбор ИИ';
+    err(e.message);
+  }
+};
+
+/* --- экспорт в Markdown --- */
+function summaryToMd(ses) {
+  const L = [];
+  L.push('# Итог занятия — ' + dateText(ses.date));
+  L.push('');
+  L.push('Тема: ' + (TOPIC_LABELS[ses.topic] || ses.topic) +
+    ' · Уровень: ' + (LEVEL_LABELS[ses.level] || ses.level) +
+    ' · ' + durationText(ses.durationSec) + ' · ' + ses.msgs + ' реплик');
+  if (ses.advice) L.push('', '## Совет', '', ses.advice);
+  L.push('', '## Ошибки');
+  if ((ses.mistakes || []).length) {
+    ses.mistakes.forEach(m => L.push('- ' + m.text.replace(/^•\s*/, '') + (m.count > 1 ? ' (×' + m.count + ')' : '')));
+  } else L.push('- Ошибок не было.');
+  if ((ses.asks || []).length) {
+    L.push('', '## О чём переспрашивал');
+    ses.asks.forEach(a => L.push('- **' + a.ar + '** — ' + shortRu(a.ru)));
+  }
+  if ((ses.words || []).length) {
+    L.push('', '## Слова занятия');
+    ses.words.forEach(w => L.push('- **' + w.ar + '** — ' + w.ru + (w.why ? ' (' + w.why + ')' : '')));
+  }
+  if ((ses.transcript || []).length) {
+    L.push('', '## Транскрипт', '');
+    ses.transcript.forEach(e => {
+      if (e.role === 'user') L.push('**Ты:** ' + e.text);
+      else {
+        L.push('**Тренер:** ' + (e.ar || ''));
+        if (e.ru) L.push('_Перевод:_ ' + e.ru);
+        if (e.fix) L.push('_Разбор:_ ' + String(e.fix).replace(/\n/g, ' '));
+      }
+      L.push('');
+    });
+  }
+  return L.join('\n');
+}
+
+function downloadSummary(ses) {
+  const blob = new Blob([summaryToMd(ses)], { type: 'text/markdown;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  const d = new Date(ses.date), pad = n => String(n).padStart(2, '0');
+  a.download = 'arabic-' + d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + '.md';
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+}
+
+$('sumMdBtn').onclick = () => { if (currentSummary) downloadSummary(currentSummary); };
+$('sumCloseBtn').onclick = () => {
+  currentSummary = null;
+  $('summarySection').classList.add('hidden');
+  $('chatSection').classList.add('hidden');
+  $('settings').classList.remove('hidden');
+  refreshSettingsLists();
+};
+
+/* --- история и словарик на экране настроек --- */
+function renderHistory() {
+  const box = $('histList');
+  box.textContent = '';
+  const list = loadSessions();
+  if (!list.length) {
+    const e = el('div', 'empty'); e.textContent = 'Пока нет сохранённых занятий.';
+    box.appendChild(e);
+    return;
+  }
+  list.forEach(ses => {
+    const row = el('div', 'histRow');
+    const when = el('span', 'when'); when.textContent = dateText(ses.date);
+    const meta = el('span', 'meta2');
+    meta.textContent = durationText(ses.durationSec) + ' · ' +
+      (TOPIC_LABELS[ses.topic] || ses.topic) + ' · ' + ses.msgs + ' репл.';
+    const open = el('button', 'secondary small'); open.textContent = 'Открыть';
+    open.onclick = () => showSummary(ses, false);
+    const del = el('button', 'secondary small'); del.textContent = '×'; del.title = 'Удалить занятие';
+    del.onclick = () => {
+      saveSessions(loadSessions().filter(s => s.id !== ses.id));
+      renderHistory();
+    };
+    row.appendChild(when); row.appendChild(meta); row.appendChild(open); row.appendChild(del);
+    box.appendChild(row);
+  });
+}
+
+function renderVocab() {
+  const box = $('vocabList');
+  box.textContent = '';
+  const v = loadVocab();
+  const items = Object.keys(v).map(k => ({ key: k, ...v[k] }));
+  if (!items.length) {
+    const e = el('div', 'empty'); e.textContent = 'Словарик пуст: слова появятся из занятий.';
+    box.appendChild(e);
+    return;
+  }
+  items.sort((a, b) => (a.status === b.status) ? (b.count - a.count) : (a.status === 'known' ? 1 : -1));
+  items.forEach(it => {
+    const row = el('div', 'vocabRow' + (it.status === 'known' ? ' known' : ''));
+    const ar = el('span', 'ar'); ar.textContent = it.ar; ar.dir = 'rtl';
+    const ru = el('span', 'ru'); ru.textContent = it.ru || '';
+    const cnt = el('span', 'cnt'); cnt.textContent = '×' + it.count;
+    const btn = el('button', 'secondary small');
+    btn.textContent = it.status === 'known' ? 'знаю ✓' : 'учу';
+    btn.title = 'Отметить слово как выученное или вернуть в повторение';
+    btn.onclick = () => {
+      const all = loadVocab();
+      if (!all[it.key]) return;
+      all[it.key].status = all[it.key].status === 'known' ? 'learn' : 'known';
+      saveJson(LS_VOCAB, all);
+      renderVocab();
+    };
+    row.appendChild(ar); row.appendChild(ru); row.appendChild(cnt); row.appendChild(btn);
+    box.appendChild(row);
+  });
+}
+
+function refreshSettingsLists() { renderHistory(); renderVocab(); }
+
+$('clearHistBtn').onclick = () => {
+  if (!confirm('Удалить всю историю занятий? Словарик останется.')) return;
+  localStorage.removeItem(LS_SESSIONS);
+  renderHistory();
+};
+$('clearVocabBtn').onclick = () => {
+  if (!confirm('Очистить словарик вместе с отметками «знаю»?')) return;
+  localStorage.removeItem(LS_VOCAB);
+  renderVocab();
+};
+
+refreshSettingsLists();
+
 /* ---------- start / stop ---------- */
 $('startBtn').onclick = () => {
   stopSession(false);
   messages = []; chat.innerHTML = ''; errBox.classList.add('hidden');
+  sessionEntries = []; sessionStartedAt = Date.now();
+  sessionTopic = $('topic').value; sessionLevel = $('level').value;
   $('settings').classList.add('hidden');
+  $('summarySection').classList.add('hidden');
   $('chatSection').classList.remove('hidden');
   messages.push({ role: 'user', content: 'Начни разговор: поздоровайся и задай первый вопрос по ситуации.' });
   sendFirst();
@@ -580,6 +1090,7 @@ async function sendFirst() {
     s.remove();
     messages.push({ role: 'assistant', content: reply });
     const p = parseReply(reply);
+    sessionEntries.push({ role: 'assistant', ar: p.ar, ru: p.ru, fix: p.fix, ok: p.ok });
     addMsg('assistant', p.ar, p.ru, null);
     speak(p.ar);
   } catch (e) { s.remove(); err(e.message); }
@@ -588,9 +1099,11 @@ async function sendFirst() {
 $('stopBtn').onclick = () => { speechSynthesis.cancel(); stopSession(false); };
 $('endBtn').onclick = () => {
   speechSynthesis.cancel(); stopSession(false);
-  $('chatSection').classList.add('hidden');
-  $('settings').classList.remove('hidden');
+  const ses = finalizeSession();     // сохраняет занятие и словарик
   messages = [];
+  $('chatSection').classList.add('hidden');
+  if (ses) showSummary(ses, true);   // локальный итог сразу, без запроса к модели
+  else $('settings').classList.remove('hidden');
 };
 
 /* ---------- текстовый ввод (гарантированная альтернатива микрофону) ---------- */
