@@ -97,7 +97,8 @@ function httpsFetch(url, options, retries = 2) {
         agent: new https.Agent({ keepAlive: false }),
         timeout: 30000,
       }, (res) => {
-        let data = '';
+        res.setEncoding('utf8');           // строки, а не Buffer: иначе русские/арабские
+        let data = '';                     // буквы рвутся на границе чанков и превращаются в «?»
         res.on('data', c => data += c);
         res.on('end', () => resolve({ status: res.statusCode, text: data }));
       });
@@ -116,7 +117,8 @@ function httpsFetch(url, options, retries = 2) {
 /* ---------- прокси к AnyModel ---------- */
 function handleChat(req, res) {
   let body = '';
-  req.on('data', c => body += c);
+  req.setEncoding('utf8');             // тело тоже декодируем как UTF-8 целиком,
+  req.on('data', c => body += c);      // иначе кириллица/арабица может испортиться
   req.on('end', async () => {
     if (!ANYMODEL_KEY) {
       res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });

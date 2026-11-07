@@ -52,6 +52,11 @@ node server.js         # http://localhost:8787/
 - ИИ-разбор: `requestAiSummary()` просит строгий JSON и парсит `extractJson()`;
   проверка формы ответа и защита от кривых полей — в `requestAiSummary`.
 - Харакаты: `stripHarakat` убирает диакритику `[\u064B-\u065F\u0670\u06D6-\u06ED]`.
+- Кодировка: в `server.js` и тело запроса, и ответ AnyModel читаются через `setEncoding('utf8')`.
+  Без этого многобайтные буквы рвутся на границах чанков и превращаются в «?»/«�».
+- Текст модели чистится `cleanText` (U+FFFD, управляющие и bidi-символы) и `normalizeArabic`
+  (персидские варианты kaf/yeh → арабские, татвиль), иначе в арабском видны «кривые» буквы.
+- Арабский шрифт задаётся `--ar-font` (Sakkal Majalla / Traditional Arabic / Noto Naskh / …).
 - Сервер форсирует IPv4 и ретраи (обход `fetch failed` на Windows).
 
 ## Известные ограничения
