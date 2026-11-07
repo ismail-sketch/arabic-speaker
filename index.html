@@ -54,6 +54,11 @@
   .msg .tr { color: var(--muted); font-size: .82rem; margin-top: 6px; }
   .msg .corr { color: #ffd479; font-size: .85rem; margin-top: 6px; border-top: 1px solid #33415c; padding-top: 6px; white-space: pre-line; line-height: 1.5; }
   .msg .corr.ok { color: var(--accent); }
+  .msgActions { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+  button.mini { padding: 4px 9px; font-size: .72rem; font-weight: 500; background: transparent;
+    border: 1px solid #33415c; color: var(--muted); border-radius: 7px; }
+  button.mini:hover { color: var(--accent); border-color: var(--accent); }
+  button.mini.recording { color: #fff; background: #ff6b6b; border-color: #ff6b6b; }
   .status { color: var(--muted); font-style: italic; font-size: .85rem; align-self: center; }
   .status.good { color: var(--accent); }
 
@@ -185,7 +190,7 @@
       <input id="textIn" placeholder="Введите фразу по-арабски или спросите по-русски (например: как сказать «я хочу кофе»?) и нажмите Enter…" />
       <button id="sendText" class="secondary">Отправить</button>
     </div>
-    <div class="hint" style="margin-top:10px; text-align:center;">Запнулись посреди фразы? Нажмите «Язык: ар» → «Язык: рус» и договорите по-русски, не останавливая запись — сказанное по-арабски сохранится и уйдёт вместе с русским. Текст в поле ниже во время записи тоже дописывается к сказанному.</div>
+    <div class="hint" style="margin-top:10px; text-align:center;">Пробел — 🎙 / отправить · Esc — стоп · Enter в поле — отправить. Запнулись посреди фразы? Нажмите «Язык: ар» → «Язык: рус» и договорите по-русски, не останавливая запись — сказанное по-арабски сохранится.</div>
   </section>
 
   <section id="summarySection" class="hidden">
@@ -259,15 +264,57 @@ function loadVoices() {
 speechSynthesis.onvoiceschanged = loadVoices;
 loadVoices();
 
-function speak(text, cb) {
+function speak(text, cb, rateOverride) {
+  if (!text) { if (cb) cb(); return; }
   speechSynthesis.cancel();
   const u = new SpeechSynthesisUtterance(text);
   u.lang = 'ar-SA';
   const v = voices[$('voice').value];
   if (v) u.voice = v;
-  u.rate = $('level').value === 'beginner' ? 0.8 : 0.95;
+  u.rate = rateOverride || ($('level').value === 'beginner' ? 0.8 : 0.95);
   u.onend = u.onerror = () => { if (cb) cb(); };
   speechSynthesis.speak(u);
+}
+
+/* ---------- запись своего голоса: сравнить с эталоном ---------- */
+let selfRecorder = null, selfStream = null, selfChunks = [], selfBtn = null;
+
+async function toggleSelfRecord(btn) {
+  if (selfRecorder && selfRecorder.state === 'recording') { selfRecorder.stop(); return; }
+  if (!navigator.mediaDevices || !window.MediaRecorder) {
+    err('Этот браузер не умеет записывать звук.');
+    return;
+  }
+  try {
+    if (sessionActive) stopSession(false);   // микрофон один — останавливаем распознавание
+    speechSynthesis.cancel();
+    selfStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    selfChunks = [];
+    const rec = new MediaRecorder(selfStream);
+    selfRecorder = rec;
+    selfBtn = btn;
+    btn.textContent = '⏹ Стоп';
+    btn.classList.add('recording');
+    rec.ondataavailable = e => { if (e.data && e.data.size) selfChunks.push(e.data); };
+    rec.onstop = () => {
+      const blob = new Blob(selfChunks, { type: rec.mimeType || 'audio/webm' });
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      audio.onended = () => URL.revokeObjectURL(url);
+      audio.play().catch(() => {});
+      if (selfStream) selfStream.getTracks().forEach(t => t.stop());
+      selfStream = null;
+      selfRecorder = null;
+      if (selfBtn) { selfBtn.textContent = '🎧 Себя'; selfBtn.classList.remove('recording'); }
+      selfBtn = null;
+    };
+    rec.start();
+  } catch (e) {
+    if (selfStream) selfStream.getTracks().forEach(t => t.stop());
+    selfStream = null;
+    selfRecorder = null;
+    err('Не удалось записать: ' + e.message);
+  }
 }
 
 /* ---------- STT (push-to-talk: говорим в своём темпе) ---------- */
@@ -519,6 +566,20 @@ function addMsg(role, ar, tr, corr, ok) {
     const c = d.querySelector('.corr');
     c.textContent = (ok ? '✓ ' : '✎ ') + corr;
     if (ok) c.classList.add('ok');
+  }
+  if (role === 'assistant' && ar) {
+    const actions = el('div', 'msgActions');
+    const rep = el('button', 'mini'); rep.type = 'button'; rep.textContent = '🔁 Повторить';
+    rep.title = 'Озвучить ответ ещё раз';
+    rep.onclick = () => speak(ar);
+    const slow = el('button', 'mini'); slow.type = 'button'; slow.textContent = '🐢 Медленнее';
+    slow.title = 'Озвучить медленнее';
+    slow.onclick = () => speak(ar, null, 0.55);
+    const self = el('button', 'mini'); self.type = 'button'; self.textContent = '🎧 Себя';
+    self.title = 'Записать свой вариант и прослушать';
+    self.onclick = () => toggleSelfRecord(self);
+    actions.appendChild(rep); actions.appendChild(slow); actions.appendChild(self);
+    d.appendChild(actions);
   }
   chat.appendChild(d);
   chat.scrollTop = chat.scrollHeight;
@@ -800,7 +861,9 @@ function wordRow(ar, ru, count, why) {
   const row = el('div', 'wordRow');
   const a = el('span', 'ar'); a.textContent = normalizeArabic(cleanText(ar)); a.dir = 'rtl';
   const r = el('span', 'ru'); r.textContent = cleanText(ru) || '';
-  row.appendChild(a); row.appendChild(r);
+  const say = el('button', 'mini'); say.type = 'button'; say.textContent = '🔊'; say.title = 'Озвучить';
+  say.onclick = () => speak(a.textContent);
+  row.appendChild(a); row.appendChild(say); row.appendChild(r);
   if (count > 1) { const c = el('span', 'cnt'); c.textContent = '×' + count; row.appendChild(c); }
   if (why) { const w = el('div', 'why'); w.textContent = cleanText(why); row.appendChild(w); }
   return row;
@@ -1069,6 +1132,8 @@ function renderVocab() {
     const ar = el('span', 'ar'); ar.textContent = normalizeArabic(cleanText(it.ar)); ar.dir = 'rtl';
     const ru = el('span', 'ru'); ru.textContent = cleanText(it.ru) || '';
     const cnt = el('span', 'cnt'); cnt.textContent = '×' + it.count;
+    const say = el('button', 'mini'); say.type = 'button'; say.textContent = '🔊'; say.title = 'Озвучить';
+    say.onclick = () => speak(ar.textContent);
     const btn = el('button', 'secondary small');
     btn.textContent = it.status === 'known' ? 'знаю ✓' : 'учу';
     btn.title = 'Отметить слово как выученное или вернуть в повторение';
@@ -1079,7 +1144,7 @@ function renderVocab() {
       saveJson(LS_VOCAB, all);
       renderVocab();
     };
-    row.appendChild(ar); row.appendChild(ru); row.appendChild(cnt); row.appendChild(btn);
+    row.appendChild(ar); row.appendChild(say); row.appendChild(ru); row.appendChild(cnt); row.appendChild(btn);
     box.appendChild(row);
   });
 }
@@ -1152,6 +1217,30 @@ function sendTyped() {
 }
 $('sendText').onclick = sendTyped;
 $('textIn').addEventListener('keydown', e => { if (e.key === 'Enter') sendTyped(); });
+
+/* ---------- горячие клавиши ---------- */
+document.addEventListener('keydown', e => {
+  if (e.repeat) return;
+  const t = e.target;
+  const typing = t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' ||
+    t.tagName === 'SELECT' || t.isContentEditable);
+
+  if (e.key === 'Escape') {
+    // Сначала закрываем итог, иначе останавливаем озвучку и запись.
+    if (!$('summarySection').classList.contains('hidden')) { $('sumCloseBtn').click(); return; }
+    speechSynthesis.cancel();
+    if (sessionActive) stopSession(false);
+    if (typing && t.blur) t.blur();
+    return;
+  }
+
+  if (typing) return;
+  if (e.code === 'Space') {
+    if ($('chatSection').classList.contains('hidden')) return;
+    e.preventDefault();
+    if (sessionActive) stopSession(true); else startSession();
+  }
+});
 
 /* ---------- диагностика распознавания ---------- */
 $('diagBtn').onclick = async () => {
