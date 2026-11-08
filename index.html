@@ -150,6 +150,14 @@
       Огласовки (харакаты) в арабском тексте
     </label>
 
+    <label for="sttReview">Проверка распознанного</label>
+    <select id="sttReview">
+      <option value="auto">Авто — если распознавание не уверено</option>
+      <option value="always">Всегда проверять перед отправкой</option>
+      <option value="never">Отправлять сразу</option>
+    </select>
+    <div class="hint">Если распознавание сомневается, текст попадёт в поле ввода: исправьте и нажмите Enter. Мимо всегда можно нажать «✎ Проверить» или Esc.</div>
+
     <div style="margin-top:14px; display:flex; gap:10px; flex-wrap:wrap;">
       <button id="startBtn">Начать разговор</button>
       <button id="diagBtn" class="secondary">Проверить микрофон</button>
@@ -178,6 +186,7 @@
     <div id="controls">
       <button id="micBtn" title="Нажмите и говорите">🎙</button>
       <button id="sendVoiceBtn" class="secondary" disabled title="Отправить распознанную речь">Готово</button>
+      <button id="reviewBtn" class="secondary" disabled title="Остановить запись и проверить распознанное перед отправкой">✎ Проверить</button>
       <button id="langBtn" class="secondary" title="Язык распознавания речи">Язык: ар</button>
       <button id="stopBtn" class="secondary">Стоп-речь</button>
       <button id="endBtn" class="secondary">Завершить</button>
@@ -190,7 +199,7 @@
       <input id="textIn" placeholder="Введите фразу по-арабски или спросите по-русски (например: как сказать «я хочу кофе»?) и нажмите Enter…" />
       <button id="sendText" class="secondary">Отправить</button>
     </div>
-    <div class="hint" style="margin-top:10px; text-align:center;">Пробел — 🎙 / отправить · Esc — стоп · Enter в поле — отправить. Запнулись посреди фразы? Нажмите «Язык: ар» → «Язык: рус» и договорите по-русски, не останавливая запись — сказанное по-арабски сохранится.</div>
+    <div class="hint" style="margin-top:10px; text-align:center;">Пробел — 🎙 / отправить · Esc — стоп (текст останется в поле для проверки) · Enter в поле — отправить. Запнулись посреди фразы? Нажмите «Язык: ар» → «Язык: рус» и договорите по-русски, не останавливая запись.</div>
   </section>
 
   <section id="summarySection" class="hidden">
@@ -222,6 +231,16 @@ $('level').value = localStorage.getItem('ar_level') || 'beginner';
 $('topic').value = localStorage.getItem('ar_topic') || 'free';
 $('level').onchange = () => localStorage.setItem('ar_level', $('level').value);
 $('topic').onchange = () => localStorage.setItem('ar_topic', $('topic').value);
+
+/* ---------- проверка распознанного перед отправкой ---------- */
+const STT_REVIEW_MODES = ['auto', 'always', 'never'];
+let sttReview = localStorage.getItem('ar_sttreview');
+if (!STT_REVIEW_MODES.includes(sttReview)) sttReview = 'auto';
+$('sttReview').value = sttReview;
+$('sttReview').onchange = () => {
+  sttReview = $('sttReview').value;
+  localStorage.setItem('ar_sttreview', sttReview);
+};
 
 /* ---------- огласовки (харакаты) ---------- */
 let tashkeel = localStorage.getItem('ar_tashkeel') === 'on';
@@ -329,6 +348,10 @@ function langsFor(mode) { return mode === 'ru' ? RU_LANGS : AR_LANGS; }
 
 let sessionActive = false;   // идёт ли сессия записи
 let sessionStartLang = null; // язык, с которого началась текущая запись
+let sawFinal = false;        // были ли финальные результаты распознавания
+let minConf = 1;             // минимальная уверенность среди финальных результатов
+let confKnown = false;       // сообщает ли браузер уверенность распознавания
+let lastReviewed = '';       // текст, положенный в поле ввода на проверку
 let base = '';               // текст, зафиксированный в предыдущих запусках движка
 let local = '';              // полный текст текущего запуска (финальный + промежуточный)
 let curLang = null;          // текущая арабская локаль
@@ -365,6 +388,8 @@ function renderTranscript() {
     : '🎤 Слушаю [' + tag + mix + ']… говорите в своём темпе (паузы можно делать). Нажмите 🎙, когда закончите.';
   const btn = $('sendVoiceBtn');
   if (btn) btn.disabled = !shown;
+  const rev = $('reviewBtn');
+  if (rev) rev.disabled = !shown;
 }
 
 function safeRestart() {
@@ -389,7 +414,15 @@ function startEngine() {
     // Берём ВЕСЬ текст текущего движка (и финальный, и промежуточный),
     // чтобы ничего не терялось на паузах.
     let full = '';
-    for (let i = 0; i < e.results.length; i++) full += e.results[i][0].transcript;
+    for (let i = 0; i < e.results.length; i++) {
+      const res = e.results[i];
+      full += res[0].transcript;
+      if (res.isFinal) {
+        sawFinal = true;
+        const c = res[0].confidence;
+        if (c > 0) { confKnown = true; minConf = Math.min(minConf, c); }
+      }
+    }
     local = full;
     renderTranscript();
   };
@@ -424,6 +457,9 @@ function startEngine() {
 
 async function startSession() {
   speechSynthesis.cancel();
+  // Если в поле лежал текст из проверки распознавания, а мы начинаем новую запись —
+  // убираем его, чтобы не отправить случайно вместе со следующим сообщением.
+  if (lastReviewed && $('textIn').value === lastReviewed) { $('textIn').value = ''; lastReviewed = ''; }
   if (!SR) { err('Браузер не поддерживает распознавание речи. Используйте Chrome/Edge или введите фразу в поле ниже.'); return; }
   const mode = micLang;
   const lang = await pickLang(mode);
@@ -434,6 +470,7 @@ async function startSession() {
     return;
   }
   curLang = lang; base = ''; local = ''; noSpeechCount = 0; sessionActive = true;
+  sawFinal = false; minConf = 1; confKnown = false;
   sessionStartLang = mode;
   $('micBtn').classList.add('listening');
   $('micBtn').title = 'Идёт запись — нажмите, чтобы отправить';
@@ -441,7 +478,7 @@ async function startSession() {
   startEngine();
 }
 
-function stopSession(send) {
+function stopSession(send, keepText) {
   const wasActive = sessionActive;
   sessionActive = false;
   clearTimeout(restartTimer);
@@ -457,17 +494,43 @@ function stopSession(send) {
     $('micStatus').textContent = '';
     const btn = $('sendVoiceBtn');
     if (btn) btn.disabled = true;
+    const rev = $('reviewBtn');
+    if (rev) rev.disabled = true;
     if (send && text) {
       // Если по-русски спрашивали «на ходу» посреди арабской фразы,
       // после отправки возвращаемся к языку, с которого начали запись.
       if (sessionStartLang && micLang !== sessionStartLang) setMicLang(sessionStartLang);
-      sendUser(text);
+      if (shouldReview(text)) moveToInput(text);
+      else sendUser(text);
+    } else if (keepText && text) {
+      moveToInput(text);           // не отправляем, но и не теряем распознанное
     }
     sessionStartLang = null;
   };
   // Небольшая задержка, чтобы браузер успел финализировать последние слова.
-  if (wasActive && send) setTimeout(finish, 600);
+  if (wasActive && (send || keepText)) setTimeout(finish, 600);
   else finish();
+}
+
+/* Оценка надёжности распознавания: отправлять сразу или дать проверить текст. */
+function shouldReview(text) {
+  if (!text || !String(text).trim()) return false;
+  if (sttReview === 'never') return false;
+  if (sttReview === 'always') return true;
+  // auto: только если распознавание действительно сомневается.
+  if (!sawFinal) return true;                  // есть лишь промежуточный результат
+  if (/[A-Za-z]/.test(text)) return true;      // латиница в арабской/русской речи — сбой
+  if (confKnown && minConf < 0.5) return true;
+  return false;
+}
+
+/* Кладём распознанное в поле ввода — пусть человек поправит опечатки STT. */
+function moveToInput(text) {
+  lastReviewed = text;
+  $('textIn').value = text;
+  $('textIn').focus();
+  try { $('textIn').setSelectionRange(text.length, text.length); } catch (e) { /* ignore */ }
+  $('micStatus').textContent = '✎ Распознано — проверьте текст ниже и нажмите Enter (или «Отправить»).';
 }
 
 $('micBtn').onclick = () => {
@@ -475,6 +538,7 @@ $('micBtn').onclick = () => {
   else startSession();
 };
 $('sendVoiceBtn').onclick = () => stopSession(true);
+$('reviewBtn').onclick = () => stopSession(false, true);   // остановить и дать проверить текст
 
 /* ---------- переключение языка распознавания речи ----------
  * Главное: переключение НЕ обрывает запись и НЕ стирает уже сказанное.
@@ -612,6 +676,39 @@ function normalizeArabic(s) {
   return out;
 }
 
+// Ключ, приравнивающий то, что распознавание речи физически не различает:
+// хамзу/алиф, та-марбуту и ха, йа и альф-максуру, огласовки и татвиль.
+// Если «исправление» отличается только этим — это шум STT, а не ошибка ученика.
+function asrKey(s) {
+  return String(s || '')
+    .normalize('NFKC')
+    .replace(HARAKAT_RE, '')
+    .replace(/\u0640/g, '')
+    .replace(/[أإآٱ]/g, 'ا')
+    .replace(/ة/g, 'ه')
+    .replace(/[ىی]/g, 'ي')
+    .replace(/ئ/g, 'ي')
+    .replace(/ؤ/g, 'و')
+    .replace(/ء/g, '')
+    .replace(/ک/g, 'ك')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// Убираем из FIX строки вида «X» → «Y», где X и Y — одно и то же слово
+// с точностью до неразличимых на слух/в STT вариантов написания.
+function filterAsrFixes(fix) {
+  if (!fix) return fix;
+  const kept = String(fix).split(/\r?\n/).filter(line => {
+    if (!line.trim()) return false;
+    const m = line.match(/«([^»]+)»\s*(?:→|->)\s*«([^»]+)»/);
+    if (!m) return true;
+    const a = asrKey(m[1]), b = asrKey(m[2]);
+    return !(a && b && a === b);
+  });
+  return kept.join('\n');
+}
+
 function parseReply(reply) {
   let ar = (reply.match(/AR:\s*([\s\S]*?)(?:RU:|FIX:|$)/) || [])[1]?.trim() || reply;
   const ru = cleanText((reply.match(/RU:\s*([\s\S]*?)(?:FIX:|$)/) || [])[1]?.trim());
@@ -620,6 +717,11 @@ function parseReply(reply) {
   fixRaw = normalizeArabic(cleanText(fixRaw));
   // Страховка: если огласовки выключены, убираем харакаты даже если модель их добавила.
   if (!tashkeel) { ar = stripHarakat(ar); fixRaw = stripHarakat(fixRaw); }
+  // Не показываем «ошибки», которые на самом деле шум STT. Если кроме них ничего
+  // не было — считаем фразу верной.
+  const fixBeforeFilter = fixRaw;
+  fixRaw = filterAsrFixes(fixRaw);
+  if (!fixRaw && fixBeforeFilter) fixRaw = 'Отлично!';
   const ok = /^отлично/i.test(fixRaw);
   return { ar, ru, fix: fixRaw || null, ok };
 }
@@ -670,6 +772,11 @@ FIX: <разбор ошибок в последней фразе ученика>
   • Порядок слов / предлоги / артикль / род / число / падеж — так же, если применимо.
 - Пояснения — по-русски, коротко и понятно. Указывай только проблемные места, не переписывай всю фразу, если она верна.
 - Не выдумывай ошибок: разбирай только то, что действительно неверно.
+- ВАЖНО: фразы ученика чаще всего приходят из распознавания речи (STT), а не напечатаны вручную. Арабское распознавание часто путает похожие буквы и слова, теряет хамзу, та-марбуту, огласовки и короткие гласные, иногда вставляет лишнее слово или обрывает фразу.
+  • Не считай артефакты распознавания ошибками ученика. Не придирайся к тому, что STT физически не различает: огласовки, хамза (أ/ا), та-марбута (ة/ه), удвоение, короткие гласные — если смысл фразы не меняется.
+  • Орфографические мелочи, которые STT не различает (ة/ه، أ/ا، ى/ي، огласовки, хамза), НЕ выноси в FIX вообще — это не ошибка ученика, а шум распознавания.
+  • Если фраза выглядит как явный сбой распознавания (бессмысленный набор слов, не тот корень, обрыв, случайная латиница), НЕ разбирай её по правилам. В FIX одной строкой напиши: «Похоже, распознано неверно: …». В AR дай наиболее вероятную фразу, которую ученик имел в виду, и продолжи диалог.
+  • Если фраза грамматически возможна и понятна по смыслу — считай её верной, даже если звучит непривычно.
 - Если ошибок нет (и это не запрос помощи по-русски) — напиши ровно: Отлично!
 - СМЕШАННЫЙ РЕЖИМ (арабский + русский): ученик может писать или говорить по-русски — особенно когда не знает, как сказать фразу по-арабски. Это нормально и НЕ является ошибкой; на русскую фразу в FIX не жалуйся.
 - Фраза ученика может быть СМЕШАННОЙ прямо в одном сообщении (сказал по-арабски, запнулся и добавил по-русски). Понимай её как одну мысль:
@@ -1205,6 +1312,7 @@ function sendTyped() {
   const v = $('textIn').value.trim();
   if (!v) return;
   $('textIn').value = '';
+  lastReviewed = '';
   // Если сейчас идёт запись — текст добавляется к сказанному, а не отправляется
   // отдельно: так можно на ходу вписать русское уточнение к арабской фразе.
   if (sessionActive) {
@@ -1229,7 +1337,7 @@ document.addEventListener('keydown', e => {
     // Сначала закрываем итог, иначе останавливаем озвучку и запись.
     if (!$('summarySection').classList.contains('hidden')) { $('sumCloseBtn').click(); return; }
     speechSynthesis.cancel();
-    if (sessionActive) stopSession(false);
+    if (sessionActive) stopSession(false, true);   // текст не теряем — кладём в поле на проверку
     if (typing && t.blur) t.blur();
     return;
   }
