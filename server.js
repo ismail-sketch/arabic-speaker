@@ -154,15 +154,121 @@ function handleChat(req, res) {
   });
 }
 
+/* ---------- распознавание речи через AnyModel (любой браузер) ---------- */
+const MODEL_TRANSCRIBE = process.env.MODEL_TRANSCRIBE || 'gc/gemini-2.5-flash';
+const MAX_AUDIO_B64 = 12 * 1024 * 1024;
+
+const AUDIO_FORMATS = {
+  'audio/wav': 'wav', 'audio/x-wav': 'wav', 'audio/wave': 'wav',
+  'audio/mpeg': 'mp3', 'audio/mp3': 'mp3',
+  'audio/ogg': 'ogg', 'audio/webm': 'webm',
+  'audio/mp4': 'm4a', 'audio/aac': 'aac', 'audio/flac': 'flac',
+};
+
+function handleTranscribe(req, res) {
+  let body = '';
+  let size = 0;
+  let tooBig = false;
+  req.setEncoding('utf8');
+  req.on('data', c => {
+    size += Buffer.byteLength(c);
+    if (size > MAX_AUDIO_B64) { tooBig = true; body = ''; return; }
+    if (!tooBig) body += c;
+  });
+  req.on('end', async () => {
+    if (!ANYMODEL_KEY) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: 'Не задан ANYMODEL_KEY.' }));
+      return;
+    }
+    if (tooBig) {
+      res.writeHead(413, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: 'Аудио слишком длинное. Говорите короче (до минуты).' }));
+      return;
+    }
+
+    let payload;
+    try { payload = JSON.parse(body); }
+    catch { res.writeHead(400, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: 'Bad JSON' })); return; }
+
+    const audio = String(payload.audio || '');
+    if (!audio) {
+      res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: 'Нет аудио.' }));
+      return;
+    }
+
+    const format = AUDIO_FORMATS[String(payload.mime || 'audio/wav').toLowerCase()] || 'wav';
+    const langHint = payload.lang === 'ru'
+      ? 'Скорее всего говорят по-русски, но могут вставлять арабские слова.'
+      : 'Скорее всего говорят по-арабски (фусха), но могут вставлять русские слова.';
+
+    const instruction = `Ты — точный распознаватель речи. Расшифруй аудио дословно на том языке, на котором говорят. ${langHint} Смешанную речь сохраняй как есть, ничего не переводи и не исправляй. Верни ТОЛЬКО распознанный текст, без кавычек, пояснений и markdown. Если речи нет или она неразборчива — верни ровно [EMPTY].`;
+
+    const upstreamBody = JSON.stringify({
+      model: MODEL_TRANSCRIBE,
+      temperature: 0,
+      max_tokens: 400,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: instruction },
+          { type: 'input_audio', input_audio: { data: audio, format } },
+        ],
+      }],
+    });
+
+    try {
+      const upstream = await httpsFetch(`${ANYMODEL_BASE}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(upstreamBody),
+          'Authorization': `Bearer ${ANYMODEL_KEY}`,
+        },
+        body: upstreamBody,
+      }, 0);   // без ретраев: аудио большое, повтор не нужен
+
+      if (upstream.status < 200 || upstream.status >= 300) {
+        console.error('[transcribe error]', upstream.status, upstream.text.slice(0, 300));
+        res.writeHead(502, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: 'Модель не смогла распознать аудио (' + upstream.status + ').' }));
+        return;
+      }
+
+      const data = JSON.parse(upstream.text);
+      let text = String(data.choices?.[0]?.message?.content || '').trim();
+      text = text.replace(/^```[a-z]*\s*/i, '').replace(/```$/i, '').trim();
+      text = text.replace(/^["'«]+|["'»]+$/g, '').trim();
+      if (/^\[?empty\]?$/i.test(text)) text = '';
+
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ text }));
+    } catch (e) {
+      console.error('[transcribe error]', e.message);
+      res.writeHead(502, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: 'Не удалось распознать речь: ' + e.message }));
+    }
+  });
+}
+
 const server = http.createServer((req, res) => {
-  if (req.method === 'POST' && req.url.split('?')[0] === '/api/chat') return handleChat(req, res);
+  const pathname = req.url.split('?')[0];
+  if (req.method === 'POST' && pathname === '/api/chat') return handleChat(req, res);
+  if (req.method === 'POST' && pathname === '/api/transcribe') return handleTranscribe(req, res);
+  if (req.method === 'GET' && pathname === '/api/stt') {
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ ok: !!ANYMODEL_KEY, model: MODEL_TRANSCRIBE }));
+    return;
+  }
   if (req.method === 'GET') return serveStatic(req, res);
   res.writeHead(405).end('Method not allowed');
 });
 
 server.listen(PORT, () => {
   console.log(`\n  Тренажёр арабского запущен:  http://localhost:${PORT}/`);
-  console.log(`  Модель: ${MODEL} (через AnyModel)`);
+  console.log(`  Модель диалога: ${MODEL} (через AnyModel)`);
+  console.log(`  Распознавание речи: ${MODEL_TRANSCRIBE} (через AnyModel)`);
   if (!ANYMODEL_KEY) console.log('  ВНИМАНИЕ: ANYMODEL_KEY не задан — создайте .env (см. .env.example).');
   console.log('');
 });

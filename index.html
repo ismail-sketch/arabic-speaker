@@ -150,6 +150,14 @@
       Огласовки (харакаты) в арабском тексте
     </label>
 
+    <label for="sttEngine">Распознавание речи</label>
+    <select id="sttEngine">
+      <option value="auto">Авто — браузерное, иначе серверное</option>
+      <option value="browser">Браузерное — Chrome/Edge, быстро</option>
+      <option value="server">Серверное — любой браузер, точнее</option>
+    </select>
+    <div class="hint">Firefox и Safari не умеют распознавать речь сами — «Авто» включит серверное распознавание через AnyModel.</div>
+
     <label for="sttReview">Проверка распознанного</label>
     <select id="sttReview">
       <option value="auto">Авто — если распознавание не уверено</option>
@@ -241,6 +249,19 @@ $('sttReview').onchange = () => {
   sttReview = $('sttReview').value;
   localStorage.setItem('ar_sttreview', sttReview);
 };
+
+/* ---------- движок распознавания: браузерный или серверный ---------- */
+const STT_ENGINES = ['auto', 'browser', 'server'];
+let sttEngine = localStorage.getItem('ar_sttengine');
+if (!STT_ENGINES.includes(sttEngine)) sttEngine = 'auto';
+$('sttEngine').value = sttEngine;
+$('sttEngine').onchange = () => {
+  sttEngine = $('sttEngine').value;
+  localStorage.setItem('ar_sttengine', sttEngine);
+};
+// Серверное распознавание нужно, если браузер не умеет речь сам
+// или пользователь явно выбрал его (например, Firefox/Safari).
+function usingServerSTT() { return sttEngine === 'server' || (sttEngine === 'auto' && !SR); }
 
 /* ---------- огласовки (харакаты) ---------- */
 let tashkeel = localStorage.getItem('ar_tashkeel') === 'on';
@@ -376,6 +397,172 @@ async function pickLang(mode) {
   return null;
 }
 
+/* ---------- серверное распознавание (Firefox, Safari, любой браузер) ----------
+ * Браузер пишет звук в PCM, мы собираем WAV и отправляем на /api/transcribe.
+ * Так микрофон работает там, где нет Web Speech API. */
+let srv = { ctx: null, stream: null, proc: null, source: null, gain: null, chunks: [], startedAt: 0, timer: null };
+let srvBusy = false;   // идёт расшифровка предыдущей записи
+
+function srvRecording() { return !!(srv.ctx && srv.stream); }
+
+function concatFloat(chunks) {
+  let len = 0;
+  for (const c of chunks) len += c.length;
+  const out = new Float32Array(len);
+  let off = 0;
+  for (const c of chunks) { out.set(c, off); off += c.length; }
+  return out;
+}
+
+function downsampleTo16k(samples, rate) {
+  if (!samples.length || rate === 16000) return samples;
+  const ratio = rate / 16000;
+  const len = Math.max(1, Math.floor(samples.length / ratio));
+  const out = new Float32Array(len);
+  for (let i = 0; i < len; i++) {
+    const pos = i * ratio, i0 = Math.floor(pos);
+    const i1 = Math.min(i0 + 1, samples.length - 1), f = pos - i0;
+    out[i] = samples[i0] * (1 - f) + samples[i1] * f;
+  }
+  return out;
+}
+
+function encodeWav(samples, rate) {
+  const buf = new ArrayBuffer(44 + samples.length * 2);
+  const v = new DataView(buf);
+  const wr = (off, s) => { for (let i = 0; i < s.length; i++) v.setUint8(off + i, s.charCodeAt(i)); };
+  wr(0, 'RIFF'); v.setUint32(4, 36 + samples.length * 2, true); wr(8, 'WAVE');
+  wr(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true);
+  v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  wr(36, 'data'); v.setUint32(40, samples.length * 2, true);
+  let off = 44;
+  for (let i = 0; i < samples.length; i++, off += 2) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    v.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+  }
+  return buf;
+}
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => resolve(String(fr.result).split(',')[1] || '');
+    fr.onerror = reject;
+    fr.readAsDataURL(blob);
+  });
+}
+
+async function transcribeAudio(base64, mime, lang) {
+  const resp = await fetch('/api/transcribe', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ audio: base64, mime, lang }),
+  });
+  let data = {};
+  try { data = await resp.json(); } catch (e) { /* ignore */ }
+  if (!resp.ok) throw new Error(data.error || ('Ошибка распознавания ' + resp.status));
+  return String(data.text || '');
+}
+
+async function startServerSession() {
+  if (srvBusy) { err('Ещё расшифровываю прошлую фразу — секунду.'); return; }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    err('Браузер не даёт доступ к микрофону. Введите фразу текстом.');
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    const ctx = new Ctx();
+    if (ctx.state === 'suspended') await ctx.resume();
+    const source = ctx.createMediaStreamSource(stream);
+    const proc = ctx.createScriptProcessor(4096, 1, 1);
+    const gain = ctx.createGain();
+    gain.gain.value = 0;                     // не выводим микрофон в колонки
+    const chunks = [];
+    proc.onaudioprocess = e => {
+      if (!srv.ctx) return;
+      chunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+    };
+    source.connect(proc); proc.connect(gain); gain.connect(ctx.destination);
+
+    srv = { ctx, stream, proc, source, gain, chunks, startedAt: Date.now(), timer: null };
+    sessionActive = true;
+    sessionStartLang = micLang;
+    base = ''; local = '';
+    $('micBtn').classList.add('listening');
+    $('micBtn').title = 'Идёт запись — нажмите, чтобы распознать';
+    $('micStatus').textContent = '🎤 [сервер] Запись… 0 с · нажмите 🎙 или «Готово»';
+    const btn = $('sendVoiceBtn'); if (btn) btn.disabled = false;
+    const rev = $('reviewBtn'); if (rev) rev.disabled = false;
+
+    srv.timer = setInterval(() => {
+      if (!srv.ctx) return;
+      const sec = Math.floor((Date.now() - srv.startedAt) / 1000);
+      if (sec >= 60) { stopServerSession(true); return; }   // предохранитель
+      const typed = base ? ' · добавлено: ' + base : '';
+      $('micStatus').textContent = '🎤 [сервер] Запись… ' + sec + ' с' + typed + ' · нажмите 🎙 или «Готово»';
+    }, 500);
+  } catch (e) {
+    sessionActive = false;
+    err('Нет доступа к микрофону: ' + e.message);
+  }
+}
+
+function stopServerSession(send, keepText) {
+  if (!srvRecording()) return;
+  const r = srv;
+  clearInterval(r.timer);
+  sessionActive = false;
+  $('micBtn').classList.remove('listening');
+  $('micBtn').title = 'Нажмите и говорите';
+  const btn = $('sendVoiceBtn'); if (btn) btn.disabled = true;
+  const rev = $('reviewBtn'); if (rev) rev.disabled = true;
+
+  try { r.proc.disconnect(); r.source.disconnect(); r.gain.disconnect(); } catch (e) { /* ignore */ }
+  try { r.stream.getTracks().forEach(t => t.stop()); } catch (e) { /* ignore */ }
+  const rate = r.ctx.sampleRate;
+  try { r.ctx.close(); } catch (e) { /* ignore */ }
+  const samples = concatFloat(r.chunks);
+  const typed = base;              // текст, набранный во время записи
+  base = ''; local = '';
+  srv = { ctx: null, stream: null, proc: null, source: null, gain: null, chunks: [], startedAt: 0, timer: null };
+  $('micStatus').textContent = '';
+
+  if (!send && !keepText) return;            // «Стоп-речь» — просто выбрасываем
+
+  // Проверяем, что вообще что-то было слышно.
+  let peak = 0;
+  for (let i = 0; i < samples.length; i += 7) peak = Math.max(peak, Math.abs(samples[i]));
+  if (peak < 0.005) { err('Не расслышал — попробуйте ещё раз поближе к микрофону.'); return; }
+
+  const pcm = downsampleTo16k(samples, rate);
+  const blob = new Blob([encodeWav(pcm, 16000)], { type: 'audio/wav' });
+  $('micStatus').textContent = '⏳ Распознаю речь…';
+  srvBusy = true;
+
+  (async () => {
+    try {
+      const b64 = await blobToBase64(blob);
+      const text = (await transcribeAudio(b64, 'audio/wav', micLang)).trim();
+      const full = joinText(typed, text);
+      $('micStatus').textContent = '';
+      if (!full) { err('Не расслышал — попробуйте ещё раз.'); return; }
+      // Это уже готовый текст от модели: уверенность неизвестна, лишний раз не переспрашиваем.
+      sawFinal = true; confKnown = false; minConf = 1;
+      if (keepText) moveToInput(full);            // «Проверить» / Esc — не отправляем
+      else if (shouldReview(full)) moveToInput(full);
+      else sendUser(full);
+    } catch (e) {
+      $('micStatus').textContent = '';
+      err('Не удалось распознать: ' + e.message);
+    } finally {
+      srvBusy = false;
+    }
+  })();
+}
+
 function renderTranscript() {
   const shown = currentText();
   // Пока идёт запись, показываем язык, на котором слушаем СЕЙЧАС.
@@ -460,6 +647,7 @@ async function startSession() {
   // Если в поле лежал текст из проверки распознавания, а мы начинаем новую запись —
   // убираем его, чтобы не отправить случайно вместе со следующим сообщением.
   if (lastReviewed && $('textIn').value === lastReviewed) { $('textIn').value = ''; lastReviewed = ''; }
+  if (usingServerSTT()) return startServerSession();
   if (!SR) { err('Браузер не поддерживает распознавание речи. Используйте Chrome/Edge или введите фразу в поле ниже.'); return; }
   const mode = micLang;
   const lang = await pickLang(mode);
@@ -479,6 +667,7 @@ async function startSession() {
 }
 
 function stopSession(send, keepText) {
+  if (srvRecording()) return stopServerSession(send, keepText);
   const wasActive = sessionActive;
   sessionActive = false;
   clearTimeout(restartTimer);
@@ -582,7 +771,8 @@ async function switchLangLive() {
 
 $('langBtn').onclick = () => {
   setMicLang(micLang === 'ru' ? 'ar' : 'ru');
-  if (sessionActive) switchLangLive();
+  // В серверном режиме язык определяется автоматически — движок перезапускать не нужно.
+  if (sessionActive && !usingServerSTT()) switchLangLive();
 };
 updateLangBtn();
 
@@ -1273,6 +1463,7 @@ refreshSettingsLists();
 
 /* ---------- start / stop ---------- */
 $('startBtn').onclick = () => {
+  if (srvBusy) { err('Секунду — ещё расшифровываю прошлую фразу.'); return; }
   stopSession(false);
   messages = []; chat.innerHTML = ''; errBox.classList.add('hidden');
   sessionEntries = []; sessionStartedAt = Date.now();
@@ -1299,6 +1490,7 @@ async function sendFirst() {
 
 $('stopBtn').onclick = () => { speechSynthesis.cancel(); stopSession(false); };
 $('endBtn').onclick = () => {
+  if (srvBusy) { err('Секунду — ещё расшифровываю фразу.'); return; }
   speechSynthesis.cancel(); stopSession(false);
   const ses = finalizeSession();     // сохраняет занятие и словарик
   messages = [];
@@ -1318,7 +1510,7 @@ function sendTyped() {
   if (sessionActive) {
     commitLocal();
     base = joinText(base, v);
-    renderTranscript();
+    if (!srvRecording()) renderTranscript();
     return;
   }
   sendUser(v);
@@ -1353,20 +1545,36 @@ document.addEventListener('keydown', e => {
 /* ---------- диагностика распознавания ---------- */
 $('diagBtn').onclick = async () => {
   const out = $('diagOut');
-  if (!SR) { out.textContent = 'Распознавание речи: НЕ поддерживается этим браузером.'; return; }
-  out.textContent = 'Проверяю поддержку распознавания…';
-  if (!SR.available) { out.textContent = 'Браузер поддерживает распознавание, но не умеет проверять языки (старая версия).'; return; }
-  const check = async (list) => {
-    const parts = [];
-    for (const l of list) {
-      try { parts.push(l + ' — ' + await SR.available({ langs: [l] })); }
-      catch (e) { parts.push(l + ' — ошибка'); }
+  out.textContent = 'Проверяю распознавание…';
+  const lines = [];
+  lines.push('Движок: ' + (usingServerSTT() ? 'серверный (любой браузер)' : 'браузерный'));
+  if (SR) {
+    lines.push('Браузерное распознавание: есть');
+    if (SR.available) {
+      const check = async (list) => {
+        const parts = [];
+        for (const l of list) {
+          try { parts.push(l + ' — ' + await SR.available({ langs: [l] })); }
+          catch (e) { parts.push(l + ' — ошибка'); }
+        }
+        return parts.join('; ');
+      };
+      lines.push('Арабский: ' + await check(AR_LANGS));
+      lines.push('Русский: ' + await check(RU_LANGS));
+    } else {
+      lines.push('Проверка языков браузером не поддерживается');
     }
-    return parts.join('; ');
-  };
-  const ar = await check(AR_LANGS);
-  const ru = await check(RU_LANGS);
-  out.textContent = 'Арабский: ' + ar + '  |  Русский: ' + ru;
+  } else {
+    lines.push('Браузерное распознавание: НЕТ (используется серверное)');
+  }
+  try {
+    const r = await fetch('/api/stt');
+    const j = await r.json();
+    lines.push('Серверное распознавание: ' + (j.ok ? 'доступно (' + j.model + ')' : 'недоступно — проверьте ANYMODEL_KEY'));
+  } catch (e) {
+    lines.push('Серверное распознавание: сервер не отвечает');
+  }
+  out.textContent = lines.join(' · ');
 };
 
 if (navigator.mediaDevices) navigator.mediaDevices.getUserMedia({ audio: true }).catch(() => {});
