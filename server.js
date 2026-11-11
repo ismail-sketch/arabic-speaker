@@ -155,7 +155,9 @@ function handleChat(req, res) {
 }
 
 /* ---------- распознавание речи через AnyModel (любой браузер) ---------- */
-const MODEL_TRANSCRIBE = process.env.MODEL_TRANSCRIBE || 'gc/gemini-2.5-flash';
+const MODEL_TRANSCRIBE = process.env.MODEL_TRANSCRIBE || 'gc/gemini-3.1-flash-lite-preview';
+// Модели, которые реально принимают аудио через этот шлюз. Порядок — запасной.
+const TRANSCRIBE_FALLBACKS = ['ag/gemini-3.8-flash-low', 'ag/gemini-3.8-flash-medium', 'gc/gemini-3.1-flash-lite-preview'];
 const MAX_AUDIO_B64 = 12 * 1024 * 1024;
 
 const AUDIO_FORMATS = {
@@ -203,22 +205,23 @@ function handleTranscribe(req, res) {
       ? 'Скорее всего говорят по-русски, но могут вставлять арабские слова.'
       : 'Скорее всего говорят по-арабски (фусха), но могут вставлять русские слова.';
 
-    const instruction = `Ты — точный распознаватель речи. Расшифруй аудио дословно на том языке, на котором говорят. ${langHint} Смешанную речь сохраняй как есть, ничего не переводи и не исправляй. Верни ТОЛЬКО распознанный текст, без кавычек, пояснений и markdown. Если речи нет или она неразборчива — верни ровно [EMPTY].`;
+    const instruction = `Расшифруй это аудио дословно. ${langHint} Смешанную речь сохраняй как есть, ничего не переводи и не исправляй. Верни только текст, без пояснений.`;
 
-    const upstreamBody = JSON.stringify({
-      model: MODEL_TRANSCRIBE,
-      temperature: 0,
-      max_tokens: 400,
-      messages: [{
-        role: 'user',
-        content: [
-          { type: 'text', text: instruction },
-          { type: 'input_audio', input_audio: { data: audio, format } },
-        ],
-      }],
-    });
-
-    try {
+    // Один проход к модели. Возвращает { ok, text } — ok=false, если модель
+    // вместо расшифровки ответила отказом или выдумкой (шлюз иногда теряет аудио).
+    const runOnce = async (model) => {
+      const upstreamBody = JSON.stringify({
+        model,
+        temperature: 0,
+        max_tokens: 400,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'text', text: instruction },
+            { type: 'input_audio', input_audio: { data: audio, format } },
+          ],
+        }],
+      });
       const upstream = await httpsFetch(`${ANYMODEL_BASE}/chat/completions`, {
         method: 'POST',
         headers: {
@@ -227,23 +230,51 @@ function handleTranscribe(req, res) {
           'Authorization': `Bearer ${ANYMODEL_KEY}`,
         },
         body: upstreamBody,
-      }, 0);   // без ретраев: аудио большое, повтор не нужен
+      }, 0);   // без ретраев: аудио большое, повтор делаем сами
 
       if (upstream.status < 200 || upstream.status >= 300) {
-        console.error('[transcribe error]', upstream.status, upstream.text.slice(0, 300));
+        console.error('[transcribe]', model, 'HTTP', upstream.status);
+        return { ok: false, retry: true, text: '' };
+      }
+      let text = '';
+      try {
+        const data = JSON.parse(upstream.text);
+        text = String(data.choices?.[0]?.message?.content || '');
+      } catch (e) { return { ok: false, retry: true, text: '' }; }
+
+      text = text.replace(/^```[a-z]*\s*/i, '').replace(/```$/i, '').trim();
+      text = text.replace(/^["'«]+|["'»]+$/g, '').trim();
+
+      // Отказы вида «не вижу аудио», «пришлите файл», эхо-повтор инструкции
+      // или рассуждения о том, что модель не умеет слушать, — это не расшифровка.
+      const refusal = /(не вижу|нет аудио|не прилож|аудиофайл|аудиозапись|прикрепи|пришлите|предоставьте|загрузите|вложени|не могу (про)?слуш|не умею|не имеет возможности|audio omitted|no audio|not (attached|provided)|cannot (transcribe|listen)|can'?t (hear|listen)|please provide|attach)/i;
+      const isEcho = /^(расшифруй|transcribe|ты —|you are)/i.test(text);
+      const looksLikeArabicOrRussian = /[\u0600-\u06FF]|[А-Яа-яЁё]/.test(text);
+      if (!text || /^\[?empty\]?$/i.test(text)) return { ok: false, retry: false, text: '' };
+      if (refusal.test(text) || isEcho || !looksLikeArabicOrRussian) return { ok: false, retry: true, text };
+      return { ok: true, text };
+    };
+
+    try {
+      let result = { ok: false, retry: true, text: '' };
+      const models = [MODEL_TRANSCRIBE, ...TRANSCRIBE_FALLBACKS]
+        .filter((m, i, a) => m && a.indexOf(m) === i);
+
+      // Шлюз иногда теряет аудио и модель отвечает отказом — пробуем другую модель.
+      for (let attempt = 0; attempt < 3; attempt++) {
+        result = await runOnce(models[attempt % models.length]);
+        if (result.ok || !result.retry) break;
+      }
+
+      if (!result.ok && result.retry) {
         res.writeHead(502, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ error: 'Модель не смогла распознать аудио (' + upstream.status + ').' }));
+        res.end(JSON.stringify({ error: 'Не удалось распознать речь. Попробуйте ещё раз или введите фразу текстом.' }));
         return;
       }
 
-      const data = JSON.parse(upstream.text);
-      let text = String(data.choices?.[0]?.message?.content || '').trim();
-      text = text.replace(/^```[a-z]*\s*/i, '').replace(/```$/i, '').trim();
-      text = text.replace(/^["'«]+|["'»]+$/g, '').trim();
-      if (/^\[?empty\]?$/i.test(text)) text = '';
-
+      // Пустой текст — значит в записи нет речи (тишина).
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({ text }));
+      res.end(JSON.stringify({ text: result.ok ? result.text : '' }));
     } catch (e) {
       console.error('[transcribe error]', e.message);
       res.writeHead(502, { 'Content-Type': 'application/json; charset=utf-8' });

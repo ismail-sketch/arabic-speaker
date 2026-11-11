@@ -254,14 +254,44 @@ $('sttReview').onchange = () => {
 const STT_ENGINES = ['auto', 'browser', 'server'];
 let sttEngine = localStorage.getItem('ar_sttengine');
 if (!STT_ENGINES.includes(sttEngine)) sttEngine = 'auto';
+let sttAutoFailed = localStorage.getItem('ar_stt_failed') === '1';
 $('sttEngine').value = sttEngine;
 $('sttEngine').onchange = () => {
   sttEngine = $('sttEngine').value;
   localStorage.setItem('ar_sttengine', sttEngine);
+  // При смене движка пробуем браузерное распознавание заново.
+  sttAutoFailed = false;
+  localStorage.removeItem('ar_stt_failed');
 };
 // Серверное распознавание нужно, если браузер не умеет речь сам
 // или пользователь явно выбрал его (например, Firefox/Safari).
-function usingServerSTT() { return sttEngine === 'server' || (sttEngine === 'auto' && !SR); }
+// Где встроенное распознавание обычно реально работает — Chrome/Edge.
+// В Firefox, Safari, Яндекс.Браузере, Opera и на iOS оно либо отсутствует,
+// либо молчит (нет доступа к сервису Google).
+function likelyGoodBrowserSTT() {
+  if (!SR) return false;
+  const ua = navigator.userAgent || '';
+  if (/Firefox|FxiOS/i.test(ua)) return false;
+  if (/OPR\/|YaBrowser|SamsungBrowser/i.test(ua)) return false;
+  if (/iPhone|iPad|iPod/i.test(ua)) return false;
+  if (/Safari\//i.test(ua) && !/Chrome|Chromium|CriOS|Edg/i.test(ua)) return false;
+  return true;
+}
+
+function usingServerSTT() {
+  return sttEngine === 'server' || (sttEngine === 'auto' && (!likelyGoodBrowserSTT() || sttAutoFailed));
+}
+
+// Браузерное распознавание «есть», но молчит (Safari, Яндекс, Opera и т.п.) —
+// запоминаем это и дальше в режиме «авто» используем сервер.
+function fallbackToServer(reason) {
+  if (sttEngine !== 'auto' || usingServerSTT()) return;
+  sttAutoFailed = true;
+  localStorage.setItem('ar_stt_failed', '1');
+  if (sessionActive) stopSession(false);
+  err((reason ? reason + '. ' : '') + 'Включено серверное распознавание речи.');
+  startServerSession();
+}
 
 /* ---------- огласовки (харакаты) ---------- */
 let tashkeel = localStorage.getItem('ar_tashkeel') === 'on';
@@ -427,6 +457,39 @@ function downsampleTo16k(samples, rate) {
   return out;
 }
 
+// Качественный ресемплинг через OfflineAudioContext (с низкочастотным фильтром),
+// с запасным простым вариантом для старых браузеров.
+async function resampleTo16k(samples, rate) {
+  if (!samples.length || rate === 16000) return samples;
+  const Off = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  if (!Off) return downsampleTo16k(samples, rate);
+  try {
+    const len = Math.max(1, Math.ceil(samples.length * 16000 / rate));
+    const off = new Off(1, len, 16000);
+    const buf = off.createBuffer(1, samples.length, rate);
+    buf.copyToChannel(samples, 0);
+    const src = off.createBufferSource();
+    src.buffer = buf;
+    src.connect(off.destination);
+    src.start();
+    const rendered = await off.startRendering();
+    return rendered.getChannelData(0);
+  } catch (e) {
+    return downsampleTo16k(samples, rate);
+  }
+}
+
+// Тихую запись подтягиваем по громкости — так модель слышит заметно лучше.
+function normalizePeak(samples) {
+  let peak = 0;
+  for (let i = 0; i < samples.length; i++) peak = Math.max(peak, Math.abs(samples[i]));
+  if (peak < 0.001 || peak > 0.98) return samples;
+  const k = 0.9 / peak;
+  const out = new Float32Array(samples.length);
+  for (let i = 0; i < samples.length; i++) out[i] = samples[i] * k;
+  return out;
+}
+
 function encodeWav(samples, rate) {
   const buf = new ArrayBuffer(44 + samples.length * 2);
   const v = new DataView(buf);
@@ -537,13 +600,13 @@ function stopServerSession(send, keepText) {
   for (let i = 0; i < samples.length; i += 7) peak = Math.max(peak, Math.abs(samples[i]));
   if (peak < 0.005) { err('Не расслышал — попробуйте ещё раз поближе к микрофону.'); return; }
 
-  const pcm = downsampleTo16k(samples, rate);
-  const blob = new Blob([encodeWav(pcm, 16000)], { type: 'audio/wav' });
   $('micStatus').textContent = '⏳ Распознаю речь…';
   srvBusy = true;
 
   (async () => {
     try {
+      const pcm = normalizePeak(await resampleTo16k(samples, rate));
+      const blob = new Blob([encodeWav(pcm, 16000)], { type: 'audio/wav' });
       const b64 = await blobToBase64(blob);
       const text = (await transcribeAudio(b64, 'audio/wav', micLang)).trim();
       const full = joinText(typed, text);
@@ -594,7 +657,13 @@ function startEngine() {
   r.lang = lang;
   r.interimResults = true;
   r.continuous = true;           // не обрывать на паузах
-  r.onstart = () => { listening = true; };
+  // Если браузер «умеет» распознавание, но движок не запускается —
+  // в режиме «авто» переходим на серверное распознавание.
+  const startGuard = setTimeout(() => {
+    if (myId !== engineSeq || !sessionActive) return;
+    if (!listening) fallbackToServer('Встроенное распознавание не запустилось');
+  }, 3000);
+  r.onstart = () => { clearTimeout(startGuard); listening = true; };
   r.onresult = e => {
     if (myId !== engineSeq) return;   // события от старого движка игнорируем
     noSpeechCount = 0;
@@ -615,6 +684,13 @@ function startEngine() {
   };
   r.onerror = e => {
     if (myId !== engineSeq) return;
+    clearTimeout(startGuard);
+    if (e.error === 'network' || e.error === 'service-not-allowed') {
+      if (sttEngine === 'auto') { fallbackToServer('Встроенное распознавание недоступно'); return; }
+      stopSession(false);
+      err('Браузерное распознавание недоступно. Выберите «Серверное» в настройках.');
+      return;
+    }
     if (e.error === 'language-not-supported') {
       // Перебираем локали того языка, на котором запущен ИМЕННО этот движок.
       const list = langsFor(String(lang).startsWith('ru') ? 'ru' : 'ar');
@@ -633,13 +709,18 @@ function startEngine() {
   };
   r.onend = () => {
     if (myId !== engineSeq) return;   // старый движок уже неактуален
+    clearTimeout(startGuard);
     listening = false;
     commitLocal();                 // сохраняем всё, что успело распознаться, ДО перезапуска
     if (!sessionActive) return;    // пользователь нажал «стоп» — отправка идёт в stopSession
     safeRestart();                 // НЕ отправляем на паузе — просто продолжаем слушать
   };
   engine = r;
-  try { r.start(); } catch (e) { safeRestart(); }
+  try { r.start(); } catch (e) {
+    clearTimeout(startGuard);
+    if (sttEngine === 'auto') fallbackToServer('Встроенное распознавание не запустилось');
+    else safeRestart();
+  }
 }
 
 async function startSession() {
@@ -1547,7 +1628,10 @@ $('diagBtn').onclick = async () => {
   const out = $('diagOut');
   out.textContent = 'Проверяю распознавание…';
   const lines = [];
-  lines.push('Движок: ' + (usingServerSTT() ? 'серверный (любой браузер)' : 'браузерный'));
+  const autoNote = sttEngine === 'auto'
+    ? ' · авто: ' + (sttAutoFailed ? 'серверное (браузерное не сработало)' : (likelyGoodBrowserSTT() ? 'браузерное' : 'серверное'))
+    : '';
+  lines.push('Движок: ' + (usingServerSTT() ? 'серверный (любой браузер)' : 'браузерный') + autoNote);
   if (SR) {
     lines.push('Браузерное распознавание: есть');
     if (SR.available) {
